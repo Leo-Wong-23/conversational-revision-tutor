@@ -1,5 +1,5 @@
-streamlit>=1.28.0
-python-dotenv>=1.0.0
-PyMuPDF>=1.23.0
-google-generativeai>=0.3.0
-streamlit-js-eval>=0.1.0
+streamlit
+python-dotenv
+PyMuPDF
+google-genai
+streamlit-js-eval
