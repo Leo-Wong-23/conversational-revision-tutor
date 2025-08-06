@@ -301,7 +301,7 @@ def _build_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude
         "compare_contrast": "Questions asking to compare or contrast two or more concepts. Example: 'Compare classical and operant conditioning' with detailed comparison in answer."
     }
     
-    base_prompt = f"""You are generating {n} flashcards for chapter "{chapter_title}". Card type: {types_s}. Difficulty: {diff}.
+    base_prompt = f"""You are generating {n} flashcards for chapter "{chapter_title}". card type: {types_s}. Difficulty: {diff}.
 
 CARD TYPE INSTRUCTIONS for {types_s}:
 {type_instructions.get(types_s, "Standard format appropriate for the selected type.")}
@@ -767,7 +767,14 @@ def render_msg(node: MsgNode):
 # -----------------------------------------------------------------------------
 
 # --- Page and Style Configuration ---
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+# Decide sidebar state from session
+sidebar_state = "expanded" if st.session_state.get("chapters") else "collapsed"
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    layout="wide",
+    initial_sidebar_state=sidebar_state,
+)
 st.markdown("""
 <style>
     div.block-container {padding-top: 1rem !important;}
@@ -1041,7 +1048,6 @@ else:
     
     # FLASHCARDS TAB
     with tab_flash:
-        st.subheader(f"Flashcards for: {active_chapter['title']}")
 
         # Generation settings in two columns at the top
         st.markdown("**Generation Settings**")
@@ -1078,17 +1084,17 @@ else:
                 current_index = card_type_options.index(s["types"])
             
             s["types"] = st.selectbox(
-                "Card type", 
+                "Flashcard type:", 
                 card_type_options,
                 index=current_index,
                 format_func=lambda x: card_type_descriptions[x]
             )
 
         with col2:
-            s["temperature"] = st.slider("Temperature", 0.0, 2.0, s["temperature"], 0.05)
+            s["temperature"] = st.slider("Temperature (How creative should the AI be?)", 0.0, 2.0, s["temperature"], 0.05)
             difficulty_options = ["mixed","easy","medium","hard"]
             s["difficulty"] = st.selectbox(
-                "Difficulty", 
+                "Difficulty:", 
                 difficulty_options,
                 index=difficulty_options.index(s["difficulty"]),
                 format_func=lambda x: x.capitalize()
@@ -1123,7 +1129,7 @@ else:
             st.session_state.custom_instructions = ""
         
         st.session_state.custom_instructions = st.text_area(
-            "**Optional** Add specific instructions to guide flashcard generation:",
+            "**(Optional)** Add specific instructions to guide flashcard generation:",
             value=st.session_state.custom_instructions,
             placeholder="e.g., Focus on definitions and key concepts, avoid overly detailed questions, include more visual/diagram-based content, etc.",
             height=80,
@@ -1135,7 +1141,7 @@ else:
         st.markdown("")
         cards = st.session_state.flashcards_by_chapter.get(st.session_state.active_chapter_index, [])
         
-        col_gen, col_randomise, col_empty = st.columns([2.4, 1.6, 8], gap="small")
+        col_gen, col_randomise, col_empty = st.columns([2.4, 2.4, 8], gap="small")
         with col_gen:
             if st.button("Generate (More) Flashcards", type="primary"):
                 # Validate settings before generation
@@ -1145,7 +1151,7 @@ else:
                     _generate_flashcards_for_active_chapter()
         
         with col_randomise:
-            if cards and st.button("Randomise Order", help="Shuffle the order of flashcards"):
+            if cards and st.button("Shuffle Flashcards", help="Shuffle the order of flashcards"):
                 import random
                 random.shuffle(cards)
                 st.session_state.flashcards_by_chapter[st.session_state.active_chapter_index] = cards
@@ -1158,16 +1164,6 @@ else:
         # Display generated cards with enhanced formatting
         for i, c in enumerate(cards):
             card_type = c.get('type', 'basic')
-            
-            # Format the question preview based on card type
-            if card_type == 'cloze':
-                preview = c['q'][:80] + "..." if len(c['q']) > 80 else c['q']
-            elif card_type == 'true_false':
-                preview = c['q'][:80] + "..." if len(c['q']) > 80 else c['q']
-            elif card_type == 'multiple_choice':
-                preview = c['q'].split('\n')[0][:80] + "..." if len(c['q'].split('\n')[0]) > 80 else c['q'].split('\n')[0]
-            else:
-                preview = c['q'][:80] + "..." if len(c['q']) > 80 else c['q']
             
             # Add type indicator to the expander title
             type_emoji = {
@@ -1182,11 +1178,8 @@ else:
             
             emoji = type_emoji.get(card_type, '📝')
             
-            with st.expander(f"{emoji} {i+1}. {preview}"):
-                # Display the full question if it was truncated
-                if len(c['q']) > 80:
-                    st.write(f"**Question:** {c['q']}")
-                
+            # Show the complete question in the expander title without truncation
+            with st.expander(f"{emoji} {i+1}. {c['q']}"):
                 # Format answer based on card type
                 if card_type == 'multiple_choice':
                     st.write(f"**Answer:** {c['a']}")
