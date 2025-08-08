@@ -6,6 +6,8 @@ import re
 import uuid
 import json
 import csv
+import hashlib
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional
@@ -96,6 +98,7 @@ class MCQ(BaseModel):
     difficulty: Literal["easy","medium","hard"] = "medium"
     tags: List[str] = []
     source: str = ""    # section heading, page, or paragraph reference
+    qtype: Literal["basic","cloze","definition","list","true_false","multiple_choice","compare_contrast"] = "multiple_choice"
     id: str = ""        # filled by app
     hash: str = ""      # normalized stem hash for dedupe
 
@@ -103,14 +106,16 @@ def _norm_stem(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 def _stem_hash(s: str) -> str:
-    import hashlib
     return hashlib.sha1(_norm_stem(s).encode()).hexdigest()[:12]
 
 def _mcq_dedupe_hashes(existing: List[dict]) -> set[str]:
     return {_stem_hash(x.get("stem","")) for x in existing if x.get("stem")}
 
+def _mcq_norm_stems(existing: List[dict]) -> set[str]:
+    """Normalized stems for prompt-time semantic-ish dedupe and planning."""
+    return {_norm_stem(x.get("stem", "")) for x in existing if x.get("stem")}
+
 def _assign_ids_and_hashes(items: List[dict]) -> List[dict]:
-    import hashlib
     out = []
     for itm in items:
         itm["hash"] = _stem_hash(itm["stem"])
@@ -278,14 +283,14 @@ def _active_cards_and_hashes() -> tuple[list[dict], set[str]]:
     all_cards = cards + imported
     def _h(q: str) -> str:
         return re.sub(r"\s+", " ", q.strip().lower())
-    hashes = {_h(c.get("q","")) for c in all_cards if c.get("q")}
-    return all_cards, hashes
+    norm_stems = {_h(c.get("q","")) for c in all_cards if c.get("q")}
+    return all_cards, norm_stems
 
 def _chapter_excerpt(text: str, limit: int=15000) -> str:
     # Use your CHAPTER_CHAR_LIMIT logic; show start + key headings if you have them
     return text[:limit]
 
-def _build_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude_hashes: set[str]) -> str:
+def _build_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude_norm_stems: set[str]) -> str:
     n = settings["n_cards"]
     types_s = settings["types"]  # Now a single string instead of list
     diff = settings["difficulty"]
@@ -323,7 +328,7 @@ IMPORTANT: For each flashcard, you MUST include a 'source' field indicating the 
     # Add the deduplication info and chapter content
     base_prompt += f"""
 
-Known question hashes to avoid (normalized): {sorted(list(exclude_hashes))[:200]}
+Known question stems to avoid (normalized): {sorted(list(exclude_norm_stems))[:200]}
 
 CHAPTER CONTENT:
 ---
@@ -336,9 +341,9 @@ CHAPTER CONTENT:
 def _generate_flashcards_for_active_chapter():
     ch = st.session_state.chapters[st.session_state.active_chapter_index]
     s = st.session_state.flash_settings
-    _, exclude_hashes = _active_cards_and_hashes()
+    _, exclude_norm_stems = _active_cards_and_hashes()
 
-    prompt = _build_prompt(ch["title"], _chapter_excerpt(ch["text"]), s, exclude_hashes)
+    prompt = _build_prompt(ch["title"], _chapter_excerpt(ch["text"]), s, exclude_norm_stems)
 
     with st.spinner("Generating flashcards…"):
         try:
@@ -350,6 +355,7 @@ def _generate_flashcards_for_active_chapter():
                 response_mime_type="application/json",
                 response_schema=list[Flashcard],
                 temperature=float(s["temperature"]),
+                system_instruction=f"Avoid generating flashcards whose questions are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:200]}"
             )
             
             resp = flash_client.models.generate_content(
@@ -457,25 +463,35 @@ def _anki_csv_bytes(cards: list[dict]) -> bytes:
 def _chapter_excerpt_for_mcq(text: str, limit: int=15000) -> str:
     return text[:limit]
 
-def _build_mcq_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude_hashes: set[str]) -> str:
+def _build_mcq_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude_norm_stems: set[str]) -> str:
     n = settings["n_qs"]
-    allow_multi = settings["allow_multi"]
+    qtype = settings.get("qtype", "multiple_choice")
+    allow_multi = (qtype == "list")
     diff = settings["difficulty_mix"]
 
     style = """Write exam-quality MCQs.
 - Use clear, unambiguous stems.
 - Randomize plausible distractors.
-- Prefer 4 options; 5 if needed. Avoid 'All/None of the above' unless pedagogically strong.
+- Prefer 4 options; more if needed. Avoid 'All/None of the above' unless pedagogically strong.
 - Include a short explanation referencing the chapter content.
 - Tag with section/topic; include difficulty from {diff}.
 - {multi}"""
 
+    # Enforce cardinality based on setting
+    multi_instruction = (
+        "Every question MUST have MULTIPLE correct options (at least two). Do NOT create questions with a single correct answer."
+        if allow_multi else
+        "Every question MUST have EXACTLY ONE correct option."
+    )
+    # Add type preference hint
+    type_hint = f"Focus on the '{qtype.replace('_',' ')}' question style when appropriate for MCQs."
+
     style = style.format(
         diff=", ".join(diff),
-        multi=("Allow multiple correct answers when appropriate."
-               if allow_multi else "Make exactly one correct option.")
+        multi=f"{multi_instruction}\n- {type_hint}"
     )
 
+    # Schema hint for the model output (always include)
     schema_hint = """Return ONLY JSON in this exact schema:
 list[MCQ] where MCQ = {
   "stem": str,
@@ -484,15 +500,21 @@ list[MCQ] where MCQ = {
   "explanation": str,
   "difficulty": "easy"|"medium"|"hard",
   "tags": List[str],
-  "source": str
+  "source": str,
+  "qtype": "basic"|"cloze"|"definition"|"list"|"true_false"|"multiple_choice"|"compare_contrast"
 }"""
+
+    # Add custom instructions if provided
+    custom_instructions = st.session_state.get("custom_mcq_instructions", "").strip()
+    if custom_instructions:
+        style += f"\n\nAdditional Instructions: {custom_instructions}"
 
     prompt = f"""
 You are creating MCQs strictly from the chapter.
 
 Chapter Title: {chapter_title}
 
-Known question hashes to avoid: {sorted(list(exclude_hashes))[:200]}
+Known question stems to avoid (normalized): {sorted(list(exclude_norm_stems))[:200]}
 
 {style}
 
@@ -511,7 +533,8 @@ def generate_mcqs_for_active_chapter():
     s = st.session_state.mcq_settings
     existing = st.session_state.mcq_by_chapter.get(st.session_state.active_chapter_index, [])
     exclude_hashes = _mcq_dedupe_hashes(existing)
-    prompt = _build_mcq_prompt(ch["title"], _chapter_excerpt_for_mcq(ch["text"]), s, exclude_hashes)
+    exclude_norm_stems = _mcq_norm_stems(existing)
+    prompt = _build_mcq_prompt(ch["title"], _chapter_excerpt_for_mcq(ch["text"]), s, exclude_norm_stems)
 
     with st.spinner("Generating MCQs…"):
         try:
@@ -522,6 +545,7 @@ def generate_mcqs_for_active_chapter():
                 response_mime_type="application/json",
                 response_schema=list[MCQ],
                 temperature=float(s["temperature"]),
+                system_instruction=f"Avoid generating MCQs whose stems are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:200]}"
             )
             resp = client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -549,8 +573,17 @@ def generate_mcqs_for_active_chapter():
                     st.error("Could not parse MCQs from the response.")
                     return
 
-            # Cleanup, dedupe, and save
+            # Cleanup, cardinality enforcement, dedupe, and save
             mcqs = [m for m in mcqs if m.get("stem") and m.get("options") and isinstance(m.get("correct"), list)]
+            # Enforce cardinality based on qtype (list = multiple correct)
+            if st.session_state.mcq_settings.get("qtype") == "list":
+                mcqs = [m for m in mcqs if len(m.get("correct", [])) >= 2]
+            else:
+                mcqs = [m for m in mcqs if len(m.get("correct", [])) == 1]
+            # Ensure qtype exists
+            for m in mcqs:
+                if not m.get("qtype"):
+                    m["qtype"] = "multiple_choice"
             mcqs = _assign_ids_and_hashes(mcqs)
             new_only = [m for m in mcqs if m["hash"] not in exclude_hashes]
 
@@ -564,7 +597,6 @@ def generate_mcqs_for_active_chapter():
 
 def mcqs_from_flashcards(cards: list[dict], k: int=10) -> list[dict]:
     """Generate MCQs from existing flashcards"""
-    import random
     pool = [c for c in cards if c.get("type","basic") in ("basic","definition")]
     random.shuffle(pool)
     out = []
@@ -583,13 +615,507 @@ def mcqs_from_flashcards(cards: list[dict], k: int=10) -> list[dict]:
         })
     return _assign_ids_and_hashes(out)
 
+# -----------------------------------------------------------------------------
+# 6. MCQ WIZARD NAVIGATION FUNCTIONS
+# -----------------------------------------------------------------------------
+
+def go_to_mcq_step(step: int):
+    """Navigate to a specific MCQ wizard step"""
+    st.session_state.mcq["step"] = max(0, min(2, step))
+
+def next_mcq_step():
+    """Navigate to next MCQ wizard step with validation"""
+    step = st.session_state.mcq["step"]
+    if step == 0 and not st.session_state.mcq["generated"]["items"]:
+        st.session_state.mcq["warning"] = "Generate at least one MCQ to continue."
+        return
+    if step == 1 and not (st.session_state.mcq["test"]["submitted"] or st.session_state.mcq["test"]["responses"]):
+        st.session_state.mcq["warning"] = "Submit the test or choose to continue without scoring."
+        return
+    st.session_state.mcq["warning"] = None
+    go_to_mcq_step(step + 1)
+
+def prev_mcq_step():
+    """Navigate to previous MCQ wizard step"""
+    step = st.session_state.mcq["step"]
+    if step == 1 and st.session_state.mcq["test"]["responses"]:
+        # Warn about losing test progress
+        if not st.session_state.get("_mcq_back_confirmed", False):
+            st.session_state.mcq["warning"] = "Going back will clear your current test answers."
+            if st.button("Confirm: Clear answers and go back", key="confirm_back"):
+                st.session_state["_mcq_back_confirmed"] = True
+                st.session_state.mcq["test"] = {
+                    "order": [], "responses": {}, "score": None, "submitted": False,
+                    "current_q": 0, "show_explanations": False
+                }
+                go_to_mcq_step(step - 1)
+            return
+    st.session_state.mcq["warning"] = None
+    st.session_state["_mcq_back_confirmed"] = False
+    go_to_mcq_step(step - 1)
+
+# -----------------------------------------------------------------------------
+# 7. MCQ WIZARD STEP FUNCTIONS
+# -----------------------------------------------------------------------------
+
+def render_mcq_generate():
+    """Render the Generate step of MCQ wizard"""
+    active_chapter = st.session_state.chapters[st.session_state.active_chapter_index]
+    
+    with st.form("mcq_generate_form"):
+        st.markdown("### Generation Settings")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            n_qs = st.number_input("Number of MCQs", 1, 30, st.session_state.mcq_settings["n_qs"])
+        with col2:
+            # Single MCQ type selector determines cardinality
+            mcq_type_options = [
+                "multiple_choice",  # Standard MCQ (single correct)
+                "list",             # Multi-correct list-style MCQ
+                "definition",
+                "true_false",
+                "compare_contrast",
+                "basic",
+                "cloze",
+            ]
+            mcq_type_labels = {
+                "multiple_choice": "Standard MCQ",
+                "list": "List (multiple correct)",
+                "definition": "Definition",
+                "true_false": "True/False",
+                "compare_contrast": "Compare/Contrast",
+                "basic": "Basic Q&A",
+                "cloze": "Cloze (fill-in-blank)",
+            }
+            current_qtype = st.session_state.mcq_settings.get("qtype", "multiple_choice")
+            qtype_sel = st.selectbox(
+                "MCQ type:",
+                mcq_type_options,
+                index=mcq_type_options.index(current_qtype) if current_qtype in mcq_type_options else 0,
+                format_func=lambda x: mcq_type_labels.get(x, x.replace('_',' ').title())
+            )
+        with col3:
+            temperature = st.slider("Creativity (temp)", 0.0, 1.0, st.session_state.mcq_settings["temperature"], 0.05)
+        with col4:
+            choices = ["easy","medium","hard"]
+            current = st.session_state.mcq_settings["difficulty_mix"]
+            difficulty_mix = st.multiselect("Difficulty mix", choices, default=current)
+
+        col_gen, col_from_flash = st.columns([1, 1])
+        
+        with col_gen:
+            generate_clicked = st.form_submit_button("Generate MCQs from Chapter", type="primary")
+            
+        with col_from_flash:
+            flashcards = st.session_state.flashcards_by_chapter.get(st.session_state.active_chapter_index, [])
+            convert_clicked = st.form_submit_button("Convert from Flashcards", disabled=not flashcards)
+
+        # Handle form submissions
+        if generate_clicked:
+            if not difficulty_mix:
+                st.error("Please select at least one difficulty level!")
+            else:
+                # Update settings
+                st.session_state.mcq_settings.update({
+                    "n_qs": n_qs,
+                    "qtype": qtype_sel,
+                    "temperature": temperature,
+                    "difficulty_mix": difficulty_mix
+                })
+                
+                # Set busy state and generate
+                st.session_state.mcq["busy"] = True
+                st.rerun()
+                
+        if convert_clicked:
+            if flashcards:
+                converted_mcqs = mcqs_from_flashcards(flashcards, min(10, len(flashcards)))
+                st.session_state.mcq["generated"]["items"] = converted_mcqs
+                st.session_state.mcq["generated"]["source_id"] = f"flashcards_ch_{st.session_state.active_chapter_index}"
+                st.session_state.mcq["generated"]["timestamp"] = datetime.now(timezone.utc).isoformat()
+                st.success(f"Converted {len(converted_mcqs)} flashcards to MCQs!")
+                st.rerun()
+
+    # Handle busy generation
+    if st.session_state.mcq["busy"]:
+        with st.spinner("Generating MCQs..."):
+            try:
+                generate_mcqs_wizard()
+            except Exception as e:
+                st.error(f"Error during MCQ generation: {e}")
+            finally:
+                st.session_state.mcq["busy"] = False
+                st.rerun()
+
+    # Show current MCQs
+    items = st.session_state.mcq["generated"]["items"]
+    if items:
+        st.markdown(f"**{len(items)} MCQs generated**")
+        
+        # Preview of generated items
+        with st.expander("Preview Generated MCQs", expanded=len(items) <= 3):
+            for i, q in enumerate(items[:5]):  # Show first 5
+                st.markdown(f"**Q{i+1}:** {q['stem']}")
+                for j, opt in enumerate(q['options']):
+                    marker = "✅" if j in q['correct'] else "○"
+                    st.markdown(f"  {marker} {chr(65+j)}. {opt}")
+            if len(items) > 5:
+                st.markdown(f"... and {len(items) - 5} more questions")
+
+def generate_mcqs_wizard():
+    """Generate MCQs for the wizard (modified version of existing function)"""
+    ch = st.session_state.chapters[st.session_state.active_chapter_index]
+    s = st.session_state.mcq_settings
+    
+    # Use existing MCQs for deduplication
+    existing = st.session_state.mcq["generated"]["items"]
+    exclude_hashes = _mcq_dedupe_hashes(existing)
+    exclude_norm_stems = _mcq_norm_stems(existing)
+    prompt = _build_mcq_prompt(ch["title"], _chapter_excerpt_for_mcq(ch["text"]), s, exclude_norm_stems)
+
+    from google import genai as _genai_new
+    client = _genai_new.Client(api_key=API_KEY)
+
+    cfg = gx.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=list[MCQ],
+        temperature=float(s["temperature"]),
+        system_instruction=f"Avoid generating MCQs whose stems are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:200]}"
+    )
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=cfg,
+    )
+
+    # Parse response
+    mcqs = []
+    try:
+        if hasattr(resp, "parsed") and resp.parsed:
+            mcqs = [x.model_dump() for x in resp.parsed]
+        elif resp.text:
+            mcqs = json.loads(resp.text)
+        else:
+            raise Exception("No response received from API")
+    except json.JSONDecodeError:
+        st.warning("Received incomplete response. Trying to extract valid MCQs…")
+        text = resp.text or ""
+        try:
+            mcqs = json.loads(text[text.find("["):text.rfind("]")+1])
+        except Exception:
+            raise Exception("Could not parse MCQs from the response.")
+
+    # Cleanup, cardinality enforcement, and dedupe
+    mcqs = [m for m in mcqs if m.get("stem") and m.get("options") and isinstance(m.get("correct"), list)]
+    if st.session_state.mcq_settings.get("qtype") == "list":
+        mcqs = [m for m in mcqs if len(m.get("correct", [])) >= 2]
+    else:
+        mcqs = [m for m in mcqs if len(m.get("correct", [])) == 1]
+    for m in mcqs:
+        if not m.get("qtype"):
+            m["qtype"] = "multiple_choice"
+    mcqs = _assign_ids_and_hashes(mcqs)
+    new_only = [m for m in mcqs if m["hash"] not in exclude_hashes]
+
+    # Store in wizard state
+    st.session_state.mcq["generated"]["items"] = new_only
+    st.session_state.mcq["generated"]["source_id"] = f"chapter_{st.session_state.active_chapter_index}"
+    st.session_state.mcq["generated"]["params"] = dict(s)
+    st.session_state.mcq["generated"]["timestamp"] = datetime.now(timezone.utc).isoformat()
+    
+    st.success(f"Generated {len(new_only)} new MCQs!")
+
+def render_mcq_test():
+    """Render the Test step of MCQ wizard"""
+    items = st.session_state.mcq["generated"]["items"]
+    test_state = st.session_state.mcq["test"]
+    
+    if not items:
+        st.warning("No MCQs available for testing. Please generate some first.")
+        return
+
+    # Initialize test session if needed
+    if not test_state["order"]:
+        # Keep questions in original display order, but shuffle options within each question
+        q_order = list(range(len(items)))  # Keep original order: [0, 1, 2, 3, ...]
+        # No longer shuffling: random.shuffle(q_order)
+        
+        shuffled_items = []
+        for qi in q_order:
+            q = dict(items[qi])
+            q["original_index"] = qi
+            
+            # Still shuffle options within each question for quiz variety
+            opt_perm = list(range(len(q["options"])))
+            random.shuffle(opt_perm)
+            q["options"] = [q["options"][i] for i in opt_perm]
+            
+            # Map correct indices through permutation
+            corr = set(q["correct"])
+            q["correct"] = [i for i, old in enumerate(opt_perm) if old in corr]
+            q["_opt_perm"] = opt_perm
+            shuffled_items.append(q)
+        
+        test_state["order"] = q_order
+        test_state["shuffled_items"] = shuffled_items
+        test_state["responses"] = {}
+        test_state["current_q"] = 0
+        test_state["submitted"] = False
+        test_state["score"] = None
+
+    # Ensure additional state exists
+    if "checked" not in test_state:
+        test_state["checked"] = {}
+
+    # Show current question
+    current_idx = test_state["current_q"]
+    shuffled_items = test_state["shuffled_items"]
+    total_questions = len(shuffled_items)
+    
+    if current_idx < total_questions:
+        q = shuffled_items[current_idx]
+        
+        st.markdown(f"**Question {current_idx + 1} of {total_questions}**")
+        st.progress((current_idx + 1) / total_questions)
+        
+        st.markdown(f"**{q['stem']}**")
+    # UI uses per-question cardinality: radio for single-correct, checkboxes for multi-correct
+    multi = len(q["correct"]) > 1
+
+    # Has this question been checked already?
+    already_checked = bool(test_state["checked"].get(current_idx))
+
+    with st.form(f"question_form_{current_idx}"):
+        user_response = None
+
+        if multi:
+            st.info("Multiple answers may be correct. Select all that apply:")
+            selections = []
+            for i, opt in enumerate(q["options"]):
+                if st.checkbox(
+                    f"{chr(65+i)}. {opt}",
+                    key=f"opt_{current_idx}_{i}",
+                    disabled=already_checked,
+                ):
+                    selections.append(i)
+            user_response = sorted(selections) if selections else None
+        else:
+            options_with_letters = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q["options"])]
+            selected = st.radio(
+                "Choose one:",
+                options_with_letters,
+                index=None,
+                key=f"radio_{current_idx}",
+                disabled=already_checked,
+            )
+            if selected is not None:
+                selected_index = options_with_letters.index(selected)
+                user_response = [selected_index]
+
+        # Feedback section (only after checking)
+        if already_checked:
+            # Use the saved response if available
+            saved_resp = test_state["responses"].get(current_idx)
+            is_correct = saved_resp is not None and set(saved_resp) == set(q["correct"])
+            if is_correct:
+                st.success("Correct!")
+            else:
+                st.error("Incorrect.")
+            correct_letters = ", ".join(chr(65+i) for i in q["correct"]) if q.get("correct") else ""
+            if correct_letters:
+                st.caption(f"Correct answer(s): {correct_letters}")
+            if q.get("explanation"):
+                st.info(q["explanation"])
+
+        # Primary action button: Check Answer -> Next Question / Finish Quiz
+        next_is_finish = current_idx >= (total_questions - 1)
+        action_label = ("Finish Quiz & View Results" if next_is_finish else "Next Question") if already_checked else "Check Answer"
+
+        if st.form_submit_button(action_label, type="primary"):
+            if not already_checked:
+                # First click: check answer and show feedback
+                if user_response is None:
+                    st.warning("Please select an answer before checking.")
+                else:
+                    test_state["responses"][current_idx] = user_response
+                    test_state["checked"][current_idx] = True
+                    st.rerun()
+            else:
+                # Second click: move to next or finish
+                if next_is_finish:
+                    submit_mcq_test()
+                    # Auto-navigate to the detailed results view
+                    st.session_state.mcq["step"] = 2
+                    st.rerun()
+                else:
+                    test_state["current_q"] = current_idx + 1
+                    st.rerun()
+    
+    # Show completion status
+    if test_state["submitted"]:
+        st.markdown("---")
+        st.subheader("Test Complete! 🎊")
+        
+        score = test_state["score"]
+        total = len(shuffled_items)
+        percentage = round(score * 100 / total) if total > 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Score", f"{score}/{total}")
+        with col2:
+            st.metric("Percentage", f"{percentage}%")
+        with col3:
+            st.metric("Questions", total)
+        
+        st.progress(score / total if total > 0 else 0)
+        
+        # Performance feedback
+        if percentage >= 90:
+            st.success("Excellent work! You've mastered this material! 🌟")
+        elif percentage >= 70:
+            st.success("Good job! You have a solid understanding. 👍")
+        elif percentage >= 50:
+            st.warning("Not bad, but there's room for improvement. Keep studying! 📚")
+        else:
+            st.error("You might want to review this chapter more thoroughly. 🔄")
+
+def submit_mcq_test():
+    """Calculate score and mark test as submitted"""
+    test_state = st.session_state.mcq["test"]
+    shuffled_items = test_state["shuffled_items"]
+    responses = test_state["responses"]
+    
+    score = 0
+    for i, q in enumerate(shuffled_items):
+        user_answer = responses.get(i)
+        correct_answer = set(q["correct"])
+        if user_answer and set(user_answer) == correct_answer:
+            score += 1
+    
+    test_state["score"] = score
+    test_state["submitted"] = True
+
+def render_mcq_review():
+    """Render the Review step of MCQ wizard"""
+    items = st.session_state.mcq["generated"]["items"]
+    test_state = st.session_state.mcq["test"]
+    
+    if not items:
+        st.warning("No MCQs available for review.")
+        return
+    
+    # Test Results Summary (if test was taken)
+    if test_state["submitted"]:
+        score = test_state["score"]
+        total = len(test_state["shuffled_items"])
+        percentage = round(score * 100 / total) if total > 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Final Score", f"{score}/{total}")
+        with col2:
+            st.metric("Percentage", f"{percentage}%")
+        with col3:
+            st.metric("Total Questions", total)
+
+    # Detailed Review
+    st.markdown("#### Detailed Question Review")
+    
+    for i, q in enumerate(items):
+        # Show full question text in expander title (no truncation)
+        with st.expander(f"Q{i+1}: {q['stem']}"):
+            st.markdown(f"**Question:** {q['stem']}")
+            
+            # Show options; if user responded, mark their selected options with ✅ if correct, ❌ if incorrect
+            st.markdown("**Options:**")
+
+            # Determine user's original (unshuffled) selected option indices for this question, if available
+            selected_original_response = None
+            if test_state["submitted"] and test_state.get("shuffled_items"):
+                shuffled_items = test_state["shuffled_items"]
+                for si, sq in enumerate(shuffled_items):
+                    if sq.get("original_index") == i:
+                        user_response = test_state["responses"].get(si)
+                        if user_response is not None:
+                            opt_perm = sq.get("_opt_perm", list(range(len(q["options"]))))
+                            selected_original_response = {opt_perm[idx] for idx in user_response}
+                        break
+
+            # Render options with appropriate markers
+            if selected_original_response is not None:
+                for j, opt in enumerate(q['options']):
+                    if j in selected_original_response:
+                        marker = "✅" if j in q['correct'] else "❌"
+                    else:
+                        marker = "○"
+                    st.markdown(f"{marker} {chr(65+j)}. {opt}")
+            else:
+                # Fallback: highlight correct options when no user selection available
+                for j, opt in enumerate(q['options']):
+                    marker = "✅" if j in q['correct'] else "○"
+                    st.markdown(f"{marker} {chr(65+j)}. {opt}")
+            
+            if q.get('explanation'):
+                st.markdown(f"**Explanation:** {q['explanation']}")
+            
+            # Show user response if test was taken
+            if test_state["submitted"] and test_state.get("shuffled_items"):
+                shuffled_items = test_state["shuffled_items"]
+                # Find this question in shuffled items
+                for si, sq in enumerate(shuffled_items):
+                    if sq.get("original_index") == i:
+                        user_response = test_state["responses"].get(si)
+                        if user_response is not None:
+                            # Map user response back through option permutation
+                            opt_perm = sq.get("_opt_perm", list(range(len(q["options"]))))
+                            original_user_response = [opt_perm[idx] for idx in user_response]
+                            
+                            correct_letters = [chr(65+idx) for idx in q['correct']]
+                            st.markdown(f"**Correct Answer:** {', '.join(correct_letters)}")
+                        break
+            
+            # Metadata
+            qtype_display = (q.get('qtype') or 'multiple_choice').replace('_',' ').title()
+            st.caption(f"**Type:** {qtype_display} | **Difficulty:** {q.get('difficulty', 'medium').title()} | **Source:** {q.get('source', 'Unknown')}")
+
+    # Navigation: Back button placed immediately after the last question
+    if st.button("◀ Back to MCQs", key="back_from_results"):
+        st.session_state.mcq["step"] = 0
+        st.rerun()
+
 # --- UI and State Management ---
+def reset_mcq_test_state():
+    """Resets the MCQ test state for a new quiz."""
+    st.session_state.mcq["test"] = {
+    "order": [], "responses": {}, "score": None, "submitted": False,
+    "current_q": 0, "show_explanations": False, "shuffled_items": [],
+    "checked": {}
+    }
+
 def reset_chat_session():
     """Resets the conversation tree for a new chat."""
     st.session_state.conv_tree = ConvTree()
     st.session_state.pending_user_node_id = None
     st.session_state.editing_msg_id = None
     st.session_state.editing_content = ""
+
+def reset_mcq_wizard():
+    """Resets the MCQ wizard state."""
+    st.session_state.mcq = {
+        "step": 0,
+    "generated": {"items": [], "seed": None, "source_id": None, "params": {}, "timestamp": None},
+    "test": {"order": [], "responses": {}, "score": None, "submitted": False, "current_q": 0, "show_explanations": False, "shuffled_items": [], "checked": {}},
+        "review": {"filters": {}, "edits": {}, "export_format": "csv"},
+        "busy": False,
+        "warning": None
+    }
+
+def reset_all_for_new_chapter():
+    """Resets both chat and MCQ wizard when changing chapters."""
+    reset_chat_session()
+    reset_mcq_wizard()
 
 def markdown_to_html(text: str) -> str:
     """Converts basic markdown formatting to HTML for bubble display."""
@@ -767,14 +1293,7 @@ def render_msg(node: MsgNode):
 # -----------------------------------------------------------------------------
 
 # --- Page and Style Configuration ---
-# Decide sidebar state from session
-sidebar_state = "expanded" if st.session_state.get("chapters") else "collapsed"
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    layout="wide",
-    initial_sidebar_state=sidebar_state,
-)
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.markdown("""
 <style>
     div.block-container {padding-top: 1rem !important;}
@@ -843,7 +1362,7 @@ if "flash_settings" not in st.session_state:
         "n_cards": 5,  # Default number of cards to generate
         "types": "basic",  # single selection: basic or cloze
         "difficulty": "mixed",        # easy|medium|hard|mixed
-        "temperature": 0.8
+    "temperature": 0.85
     }
 
 # --- MCQ Session State ---
@@ -853,15 +1372,43 @@ if "mcq_by_chapter" not in st.session_state:
 if "mcq_settings" not in st.session_state:
     st.session_state.mcq_settings = {
         "n_qs": 10,
-        "allow_multi": True,
         "difficulty_mix": ["easy","medium","hard"],  # chosen set
-        "temperature": 0.7,
+    "temperature": 0.85,
         "show_expl_immediately": True,
         "timer_seconds": 0,  # 0 = untimed
+    "qtype": "multiple_choice",
     }
 
 if "mcq_sessions" not in st.session_state:
     st.session_state.mcq_sessions = {}  # keyed by chapter index
+
+# New MCQ Wizard State
+if "mcq" not in st.session_state:
+    st.session_state.mcq = {
+        "step": 0,  # 0=Generate, 1=Test, 2=Review
+        "generated": {           # data produced in Generate
+            "items": [],         # list[dict]: question, options, answer, meta
+            "seed": None,        # to reproduce a generation
+            "source_id": None,   # chapter / doc / selection identifier
+            "params": {},        # difficulty, n_items, etc.
+            "timestamp": None,
+        },
+        "test": {                # data collected in Test
+            "order": [],         # index order after shuffle
+            "responses": {},     # q_idx -> selected_option / free text
+            "score": None,       # computed after submit
+            "submitted": False,
+            "current_q": 0,      # current question pointer
+            "show_explanations": False
+        },
+        "review": {              # preferences in Review
+            "filters": {},       # correct/incorrect tags, difficulty
+            "edits": {},         # q_idx -> edited payload
+            "export_format": "csv"
+        },
+        "busy": False,           # lock while long ops run
+        "warning": None          # transient message to surface at top
+    }
 
 conv_tree: ConvTree = st.session_state.conv_tree
 
@@ -933,7 +1480,7 @@ if not st.session_state.chapters:
                         "size": uploaded_file.size
                     }
                     st.session_state.active_chapter_index = 0
-                    reset_chat_session # Initialize the chat for the first chapter
+                    reset_chat_session()  # Initialize the chat for the first chapter
                     st.rerun()
                 else:
                     st.error("No valid chapter definitions found. Please check the format.")
@@ -953,7 +1500,7 @@ else:
             options=range(len(chapter_titles)),
             format_func=lambda i: chapter_titles[i],
             key="active_chapter_index",
-            on_change=reset_chat_session # Reset chat when chapter changes
+            on_change=reset_all_for_new_chapter # Reset both chat and MCQ when chapter changes
         )
         
         st.markdown("---")
@@ -1050,7 +1597,7 @@ else:
     with tab_flash:
 
         # Generation settings in two columns at the top
-        st.markdown("**Generation Settings**")
+        st.markdown("### Generation Settings")
         col1, col2 = st.columns([1,1])
         s = st.session_state.flash_settings
         
@@ -1091,7 +1638,14 @@ else:
             )
 
         with col2:
-            s["temperature"] = st.slider("Temperature (How creative should the AI be?)", 0.0, 2.0, s["temperature"], 0.05)
+            s["temperature"] = st.slider(
+                "Temperature (How creative should the AI be?)",
+                0.0,
+                2.0,
+                s["temperature"],
+                0.05,
+                key="flash_temp_slider",
+            )
             difficulty_options = ["mixed","easy","medium","hard"]
             s["difficulty"] = st.selectbox(
                 "Difficulty:", 
@@ -1152,7 +1706,6 @@ else:
         
         with col_randomise:
             if cards and st.button("Shuffle Flashcards", help="Shuffle the order of flashcards"):
-                import random
                 random.shuffle(cards)
                 st.session_state.flashcards_by_chapter[st.session_state.active_chapter_index] = cards
                 st.success("Cards shuffled!")
@@ -1232,263 +1785,229 @@ else:
     
     # MCQ TAB
     with tab_mcq:
-        def _get_active_mcqs() -> list[dict]:
-            return st.session_state.mcq_by_chapter.get(st.session_state.active_chapter_index, [])
-
-        st.subheader(f"Multiple Choice Questions for: {active_chapter['title']}")
-
-        # Create sub-tabs for Generate, Practice, Review
-        sub_tab_gen, sub_tab_practice, sub_tab_review = st.tabs(["Generate", "Practice", "Review & Export"])
-        
-        with sub_tab_gen:
-            st.markdown("**Generation Settings**")
-            col1, col2, col3, col4 = st.columns(4)
+        # If in Quiz or Results mode, render that view exclusively for the MCQs tab
+        if st.session_state.mcq.get("step") == 1:
+            st.markdown("### 📝 Quiz Mode")
+            render_mcq_test()
+            # Navigation back to MCQs list/settings
+            col1, col2 = st.columns(2)
             with col1:
-                st.session_state.mcq_settings["n_qs"] = st.number_input("Number of MCQs", 1, 50, st.session_state.mcq_settings["n_qs"])
-            with col2:
-                st.session_state.mcq_settings["allow_multi"] = st.checkbox("Allow multi-select", value=st.session_state.mcq_settings["allow_multi"])
-            with col3:
-                st.session_state.mcq_settings["temperature"] = st.slider("Creativity (temp)", 0.0, 1.0, st.session_state.mcq_settings["temperature"], 0.05)
-            with col4:
-                choices = ["easy","medium","hard"]
-                current = st.session_state.mcq_settings["difficulty_mix"]
-                st.session_state.mcq_settings["difficulty_mix"] = st.multiselect("Difficulty mix", choices, default=current)
+                if st.button("◀ Back to MCQs", key="back_to_mcqs_fullpage"):
+                    st.session_state.mcq["step"] = 0
+                    st.rerun()
+            # Stop here to avoid rendering the generation UI below
+            st.stop()
 
-            col_gen, col_from_flash, col_empty = st.columns([2, 2, 6])
-            with col_gen:
-                if st.button("Generate MCQs from Chapter", type="primary"):
-                    if not st.session_state.mcq_settings["difficulty_mix"]:
-                        st.error("Please select at least one difficulty level!")
-                    else:
-                        generate_mcqs_for_active_chapter()
+        elif st.session_state.mcq.get("step") == 2:
+            st.markdown("### 📊 Quiz Results")
+            render_mcq_review()
+            # Stop here to avoid rendering the generation UI below
+            st.stop()
+
+        # Generation settings in two columns at the top
+        st.markdown("### Generation Settings")
+        col1, col2 = st.columns([1,1])
+        s = st.session_state.mcq_settings
+        
+        with col1:
+            s["n_qs"] = st.slider("How many MCQs?", 1, 30, s["n_qs"])
             
-            with col_from_flash:
-                flashcards = st.session_state.flashcards_by_chapter.get(st.session_state.active_chapter_index, [])
-                if flashcards and st.button("Convert from Flashcards"):
-                    converted_mcqs = mcqs_from_flashcards(flashcards, min(10, len(flashcards)))
-                    st.session_state.mcq_by_chapter.setdefault(st.session_state.active_chapter_index, []).extend(converted_mcqs)
-                    st.success(f"Converted {len(converted_mcqs)} flashcards to MCQs!")
-                    st.rerun()
+            # Single MCQ type selector (also determines single vs multiple correct)
+            mcq_type_options = [
+                "multiple_choice",  # Standard MCQ (single correct)
+                "list",             # Multi-correct list-style MCQ
+                "definition",
+                "true_false",
+                "compare_contrast",
+                "basic",
+                "cloze",
+            ]
+            mcq_type_labels = {
+                "multiple_choice": "Standard MCQ",
+                "list": "List (multiple correct)",
+                "definition": "Definition",
+                "true_false": "True/False",
+                "compare_contrast": "Compare/Contrast",
+                "basic": "Basic Q&A",
+                "cloze": "Cloze (fill-in-blank)",
+            }
+            current_qtype = s.get("qtype", "multiple_choice")
+            s["qtype"] = st.selectbox(
+                "MCQ type:",
+                mcq_type_options,
+                index=mcq_type_options.index(current_qtype) if current_qtype in mcq_type_options else 0,
+                format_func=lambda x: mcq_type_labels.get(x, x.replace('_',' ').title())
+            )
 
-            # Show current MCQ count
-            mcqs = _get_active_mcqs()
-            st.markdown(f"**{len(mcqs)} MCQs in this chapter**")
+        with col2:
+            s["temperature"] = st.slider(
+                "Temperature (How creative should the AI be?)",
+                0.0,
+                2.0,
+                s["temperature"],
+                0.05,
+                key="mcq_temp_slider",
+            )
+            
+            # Difficulty mix selection
+            difficulty_choices = ["easy","medium","hard"]
+            current_mix = s["difficulty_mix"] if s["difficulty_mix"] else ["medium"]
+            s["difficulty_mix"] = st.multiselect(
+                "Difficulty mix:",
+                difficulty_choices,
+                default=current_mix
+            )
 
-        with sub_tab_practice:
-            mcqs = list(_get_active_mcqs())
-            if not mcqs:
-                st.info("No MCQs yet. Generate some in the 'Generate' tab.")
-            else:
-                import random
-                
-                # Practice settings
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.session_state.mcq_settings["show_expl_immediately"] = st.checkbox(
-                        "Show explanation immediately", 
-                        value=st.session_state.mcq_settings["show_expl_immediately"]
-                    )
-                with col2:
-                    st.session_state.mcq_settings["timer_seconds"] = st.number_input(
-                        "Timer per question (0 = no timer)", 
-                        0, 300, 
-                        st.session_state.mcq_settings["timer_seconds"]
-                    )
-
-                # Create/restore a quiz session
+        # Previously generated MCQs upload section
+        imported = st.file_uploader("**(Optional)** Upload JSON file to import existing MCQs", type="json", key="mcq_uploader")
+        if imported:
+            try:
+                data = json.load(imported)
+                if isinstance(data, dict) and "items" in data:
+                    data = data["items"]  # Handle export format
+                assert isinstance(data, list)
                 ch_idx = st.session_state.active_chapter_index
-                sess = st.session_state.mcq_sessions.get(ch_idx)
-                start_new = st.button("Start New Quiz", type="primary") or (sess is None)
+                st.session_state.mcq_by_chapter.setdefault(ch_idx, [])
+                st.session_state.mcq_by_chapter[ch_idx].extend(data)
+                st.success(f"Imported {len(data)} MCQs.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Invalid JSON: {e}")
 
-                if start_new:
-                    # Shuffle questions and options for this attempt
-                    q_order = list(range(len(mcqs)))
-                    random.shuffle(q_order)
-                    shuffled = []
-                    for qi in q_order:
-                        q = dict(mcqs[qi])
-                        opt_perm = list(range(len(q["options"])))
-                        random.shuffle(opt_perm)
-                        q["options"] = [q["options"][i] for i in opt_perm]
-                        # map correct indices through permutation
-                        corr = set(q["correct"])
-                        q["correct"] = [i for i, old in enumerate(opt_perm) if old in corr]
-                        q["_opt_perm"] = opt_perm  # keep if you need review mapping
-                        shuffled.append(q)
+        # Custom instructions for MCQ generation
+        if "custom_mcq_instructions" not in st.session_state:
+            st.session_state.custom_mcq_instructions = ""
+        
+        st.session_state.custom_mcq_instructions = st.text_area(
+            "**(Optional)** Add specific instructions to guide MCQ generation:",
+            value=st.session_state.custom_mcq_instructions,
+            placeholder="e.g., Focus on application questions, include scenario-based questions, avoid trivial details, etc.",
+            height=80,
+            help="These instructions will be included in the prompt to help generate more targeted MCQs"
+        )
 
-                    sess = {
-                        "idx": 0,
-                        "items": shuffled,
-                        "responses": [None] * len(shuffled),
-                        "correct_flags": [False] * len(shuffled),
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        "show_expl_immediately": st.session_state.mcq_settings["show_expl_immediately"],
-                        "timer_seconds": st.session_state.mcq_settings["timer_seconds"],
-                    }
-                    st.session_state.mcq_sessions[ch_idx] = sess
+        # Generation button and MCQ count at the bottom
+        st.markdown("")
+        mcqs = st.session_state.mcq_by_chapter.get(st.session_state.active_chapter_index, [])
+        
+        col_gen, col_randomise, col_quiz, col_empty = st.columns([2, 1.7, 2, 6.3], gap="small")
+        with col_gen:
+            if st.button("Generate (More) MCQs", type="primary"):
+                # Validate settings before generation
+                if s["n_qs"] <= 0:
+                    st.error("Please set the number of MCQs to generate to at least 1!")
+                elif not s["difficulty_mix"]:
+                    st.error("Please select at least one difficulty level!")
+                else:
+                    generate_mcqs_for_active_chapter()
+        
+        with col_randomise:
+            if mcqs and st.button("Shuffle Questions", help="Shuffle the order of MCQs"):
+                random.shuffle(mcqs)
+                st.session_state.mcq_by_chapter[st.session_state.active_chapter_index] = mcqs
+                st.success("MCQs shuffled!")
+                st.rerun()
+        
+        with col_quiz:
+            if mcqs and st.button("Start MCQ Quiz", type="primary", help="Start an interactive quiz with these questions"):
+                # Initialize quiz state and go to test mode
+                st.session_state.mcq["generated"]["items"] = mcqs.copy()
+                st.session_state.mcq["step"] = 1
+                reset_mcq_test_state()
+                st.rerun()
+        
+        # MCQ count display
+        st.markdown(f"**{len(mcqs)} MCQs in this chapter**")
+
+        # Display generated MCQs with enhanced formatting
+        for i, q in enumerate(mcqs):
+            difficulty = q.get('difficulty', 'medium').title()
+            source = q.get('source', 'Unknown')
+            
+            # Show difficulty and source as the main title
+            difficulty_emoji = {'Easy': '🟢', 'Medium': '🟡', 'Hard': '🔴'}.get(difficulty, '⚫')
+            
+            with st.expander(f"{difficulty_emoji} {i+1}. {difficulty} - {source}"):
+                # Show the actual question
+                st.markdown(f"**Question:** {q['stem']}")
+                
+                # Show options with letters
+                st.markdown("**Options:**")
+                for j, opt in enumerate(q['options']):
+                    st.markdown(f"{chr(65+j)}. {opt}")
+                
+                # Answer in nested expander
+                with st.expander("🔍 Show Answer", expanded=False):
+                    correct_letters = [chr(65+idx) for idx in q['correct']]
+                    if len(correct_letters) == 1:
+                        st.markdown(f"**Correct Answer:** {correct_letters[0]}")
+                    else:
+                        st.markdown(f"**Correct Answers:** {', '.join(correct_letters)}")
+                    
+                    # Show the correct option text(s)
+                    for idx in q['correct']:
+                        if idx < len(q['options']):
+                            st.markdown(f"✅ {q['options'][idx]}")
+                    
+                    if q.get('explanation'):
+                        st.markdown(f"**Explanation:** {q['explanation']}")
+                
+                # Enhanced metadata display
+                tags_display = ', '.join(q.get('tags', [])) if q.get('tags') else 'None'
+                qtype_display = (q.get('qtype') or 'multiple_choice').replace('_',' ').title()
+                st.caption(f"**Type:** {qtype_display} | **Tags:** {tags_display}")
+                
+                # Optional per-MCQ delete
+                if st.button("Delete this MCQ", key=f"del_mcq_{i}"):
+                    del mcqs[i]
+                    st.session_state.mcq_by_chapter[st.session_state.active_chapter_index] = mcqs
+                    st.rerun()
+        
+        # Export buttons
+        if mcqs:
+            st.markdown("---")
+            st.markdown("#### Export Options")
+            colA, colB, colC, colD = st.columns([1, 0.95, 1, 4.05], gap="small")
+            with colA:
+                export_data = {
+                    "items": mcqs,
+                    "generated_at": datetime.now(timezone.utc).isoformat()
+                }
+                st.download_button(
+                    "Download as JSON",
+                    data=json.dumps(export_data, ensure_ascii=False, indent=2),
+                    file_name=f"{active_chapter['title']}_mcqs.json",
+                    mime="application/json",
+                    help="Download MCQs in JSON format for importing into this app or other applications"
+                )
+            with colB:
+                # CSV Export
+                output = StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["stem","options","correct","explanation","difficulty","tags","source"])
+                for q in mcqs:
+                    writer.writerow([
+                        q["stem"],
+                        " | ".join(q["options"]),
+                        ",".join(map(str, q["correct"])),
+                        q.get("explanation",""),
+                        q.get("difficulty",""),
+                        ",".join(q.get("tags",[])),
+                        q.get("source",""),
+                    ])
+                
+                st.download_button(
+                    "Download as CSV",
+                    data=output.getvalue().encode("utf-8"),
+                    file_name=f"{active_chapter['title']}_mcqs.csv",
+                    mime="text/csv",
+                    help="Download MCQs in CSV format for importing into other applications"
+                )
+            with colC:
+                if st.button("Delete All", type="secondary", help="Delete all MCQs for this chapter"):
+                    # Delete all MCQs immediately
+                    st.session_state.mcq_by_chapter[st.session_state.active_chapter_index] = []
+                    st.success("All MCQs deleted!")
                     st.rerun()
 
-                if sess:
-                    # Render current question
-                    q = sess["items"][sess["idx"]]
-                    st.markdown(f"**Question {sess['idx']+1} of {len(sess['items'])}**")
-                    st.markdown(f"**{q['stem']}**")
-                    
-                    multi = len(q["correct"]) > 1
-                    user_sel = None
-
-                    if multi:
-                        # Multi-select as checkboxes
-                        st.info("Multiple answers may be correct. Select all that apply:")
-                        selections = []
-                        for i, opt in enumerate(q["options"]):
-                            if st.checkbox(f"{chr(65+i)}. {opt}", key=f"mcq_{q['id']}_{i}"):
-                                selections.append(i)
-                        user_sel = sorted(selections)
-                    else:
-                        # Single select as radio buttons
-                        options_with_letters = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q["options"])]
-                        selected_option = st.radio("Choose one:", options_with_letters, index=None, key=f"mcq_{q['id']}_radio")
-                        if selected_option is not None:
-                            user_sel = [options_with_letters.index(selected_option)]
-
-                    # Control buttons
-                    colA, colB, colC = st.columns([1,1,2])
-                    with colA:
-                        check = st.button("Check Answer", disabled=(user_sel is None))
-                    with colB:
-                        nxt = st.button("Next ➜", disabled=(sess["idx"] >= len(sess["items"]) - 1))
-                    with colC:
-                        if sess["idx"] < len(sess["items"]) - 1:
-                            st.write(f"Progress: {sess['idx']+1}/{len(sess['items'])}")
-
-                    # Handle answer checking
-                    if check and user_sel is not None:
-                        is_correct = set(user_sel) == set(q["correct"])
-                        sess["responses"][sess["idx"]] = user_sel
-                        sess["correct_flags"][sess["idx"]] = is_correct
-                        st.session_state.mcq_sessions[ch_idx] = sess  # Update session
-
-                    # Show feedback
-                    if sess["responses"][sess["idx"]] is not None and (sess["show_expl_immediately"] or check):
-                        is_correct = sess["correct_flags"][sess["idx"]]
-                        if is_correct:
-                            st.success("✅ Correct! 🎉")
-                        else:
-                            st.error("❌ Not quite right.")
-                            
-                        # Show correct answer(s)
-                        correct_letters = [chr(65+i) for i in q["correct"]]
-                        st.info(f"**Correct answer(s):** {', '.join(correct_letters)}")
-                        
-                        if q.get('explanation'):
-                            st.markdown(f"**Explanation:** {q['explanation']}")
-
-                    # Advance to next question
-                    if nxt:
-                        sess["idx"] += 1
-                        st.session_state.mcq_sessions[ch_idx] = sess
-                        st.rerun()
-
-                    # Show final results
-                    if sess["idx"] >= len(sess["items"]) - 1 and sess["responses"][-1] is not None:
-                        st.markdown("---")
-                        st.subheader("Quiz Complete! 🎊")
-                        total = len(sess["items"])
-                        score = sum(sess["correct_flags"])
-                        percentage = round(score * 100 / total) if total > 0 else 0
-                        
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Score", f"{score}/{total}")
-                        with col2:
-                            st.metric("Percentage", f"{percentage}%")
-                        with col3:
-                            st.metric("Questions", total)
-                        
-                        st.progress(score/total if total > 0 else 0)
-                        
-                        # Performance feedback
-                        if percentage >= 90:
-                            st.success("Excellent work! You've mastered this material! 🌟")
-                        elif percentage >= 70:
-                            st.success("Good job! You have a solid understanding. 👍")
-                        elif percentage >= 50:
-                            st.warning("Not bad, but there's room for improvement. Keep studying! 📚")
-                        else:
-                            st.error("You might want to review this chapter more thoroughly. 🔄")
-
-        with sub_tab_review:
-            mcqs = _get_active_mcqs()
-            if not mcqs:
-                st.info("No MCQs to review yet.")
-            else:
-                st.markdown(f"**{len(mcqs)} MCQs for review:**")
-                
-                # Simple review interface
-                for i, q in enumerate(mcqs):
-                    with st.expander(f"Q{i+1}: {q['stem'][:80]}{'...' if len(q['stem']) > 80 else ''}"):
-                        st.markdown(f"**Question:** {q['stem']}")
-                        
-                        # Show options with letters
-                        st.markdown("**Options:**")
-                        for j, opt in enumerate(q['options']):
-                            marker = "✅" if j in q['correct'] else "○"
-                            st.markdown(f"{marker} {chr(65+j)}. {opt}")
-                        
-                        if q.get('explanation'):
-                            st.markdown(f"**Explanation:** {q['explanation']}")
-                        
-                        # Metadata
-                        st.caption(f"**Difficulty:** {q.get('difficulty', 'medium').title()} | **Source:** {q.get('source', 'Unknown')}")
-                        
-                        # Delete individual MCQ
-                        if st.button("Delete this MCQ", key=f"del_mcq_{i}"):
-                            del mcqs[i]
-                            st.session_state.mcq_by_chapter[st.session_state.active_chapter_index] = mcqs
-                            st.rerun()
-
-                # Export and delete options
-                if mcqs:
-                    st.markdown("---")
-                    col1, col2, col3, col4 = st.columns([1, 1, 1, 4])
-                    
-                    with col1:
-                        # JSON Export
-                        st.download_button(
-                            "Download JSON",
-                            data=json.dumps(mcqs, ensure_ascii=False, indent=2),
-                            file_name=f"{active_chapter['title']}_mcqs.json",
-                            mime="application/json",
-                            help="Download MCQs in JSON format"
-                        )
-                    
-                    with col2:
-                        # CSV Export
-                        output = StringIO()
-                        writer = csv.writer(output)
-                        writer.writerow(["stem","options","correct","explanation","difficulty","tags","source"])
-                        for q in mcqs:
-                            writer.writerow([
-                                q["stem"],
-                                " | ".join(q["options"]),
-                                ",".join(map(str, q["correct"])),
-                                q.get("explanation",""),
-                                q.get("difficulty",""),
-                                ",".join(q.get("tags",[])),
-                                q.get("source",""),
-                            ])
-                        
-                        st.download_button(
-                            "Download CSV",
-                            data=output.getvalue().encode("utf-8"),
-                            file_name=f"{active_chapter['title']}_mcqs.csv",
-                            mime="text/csv",
-                            help="Download MCQs in CSV format"
-                        )
-                    
-                    with col3:
-                        if st.button("Delete All MCQs", type="secondary"):
-                            st.session_state.mcq_by_chapter[st.session_state.active_chapter_index] = []
-                            st.success("All MCQs deleted!")
-                            st.rerun()
+    # Quiz/Results are rendered exclusively above when active
