@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import time
+import mimetypes
 import os
 import re
 import uuid
@@ -10,7 +12,7 @@ import hashlib
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Any
 from io import BytesIO, StringIO
 
 import streamlit as st
@@ -36,7 +38,7 @@ if not API_KEY:
 
 # Basic app configuration
 APP_TITLE = "AI Revision Assistant"
-CHAPTER_CHAR_LIMIT = 700_000  # adjust to your model
+CHAPTER_CHAR_LIMIT = 1000000  # adjust to your model
 
 # Conversational style options
 CONVERSATIONAL_STYLES = {
@@ -86,6 +88,33 @@ class Flashcard(BaseModel):
     tags: List[str] = []
     source: str = Field(description="Specific section heading, subsection title, or page reference where this information appears in the chapter (e.g., 'Section 2.3: Neural Networks', 'Page 45', 'Introduction paragraph')")
 
+# --- Chapter schema (structured output for auto extraction) ---
+class ChapterDef(BaseModel):
+    title: str = Field(description="Exact top-level chapter or unit title as it appears in the PDF table of contents or headings.")
+    start_page: int = Field(ge=1, description="Start page number, using the PDF's 1-based page order.")
+    end_page: int = Field(ge=1, description="Inclusive end page number, using the PDF's 1-based page order.")
+
+# --- ToC-first light extraction schema (model returns ToC labels + chapter ranges) ---
+class TocChapter(BaseModel):
+    title: str = Field(description="Exact top-level chapter/part title as written in the ToC (no normalization beyond trimming).")
+    toc_start_page: int = Field(ge=1, description="The page number as printed in the Table of Contents for this chapter/part (an integer).")
+    inferred_end_page: int = Field(ge=1, description="The inferred end page for this chapter based on ToC analysis and document structure. Should be the page before the next chapter starts, or before document end matter if it's the last chapter.")
+
+class TocExtraction(BaseModel):
+    chapters: List[TocChapter] = Field(description="Top-level chapters/parts in ToC order with their printed page numbers and inferred end pages.")
+    first_chapter_toc_page: Optional[int] = Field(
+        default=None,
+        description=(
+            "The page number as printed in the Table of Contents for the FIRST chapter (should match chapters[0].toc_start_page)."
+        ),
+    )
+    first_chapter_actual_page: Optional[int] = Field(
+        default=None,
+        description=(
+            "The actual 1-based PDF page index where the first chapter's heading appears in the document body."
+        ),
+    )
+
 # -----------------------------------------------------------------------------
 # 3. MCQ SCHEMA & UTILITIES
 # -----------------------------------------------------------------------------
@@ -98,15 +127,36 @@ class MCQ(BaseModel):
     difficulty: Literal["easy","medium","hard"] = "medium"
     tags: List[str] = []
     source: str = ""    # section heading, page, or paragraph reference
-    qtype: Literal["basic","cloze","definition","list","true_false","multiple_choice","compare_contrast"] = "multiple_choice"
+    qtype: Literal[
+        "cloze","definition","list","true_false","multiple_choice","compare_contrast",
+        "assertion_reason","sequence_ordering","matching_matrix","k_type","best_next_step",
+        "cause_effect","negative"
+    ] = "multiple_choice"
     id: str = ""        # filled by app
     hash: str = ""      # normalized stem hash for dedupe
+    meta: Optional[Dict[str, Any]] = None  # optional metadata e.g., entities, format hints
+
+# NOTE: Gemini typed response schemas do not support free-form objects (additionalProperties).
+# To avoid schema errors, use this minimal schema for model responses and enrich later in-app.
+class MCQGen(BaseModel):
+    stem: str
+    options: List[str]
+    correct: List[int]
+    explanation: str = ""
+    difficulty: Literal["easy","medium","hard"] = "medium"
+    tags: List[str] = []
+    source: str = ""
+    qtype: Literal[
+        "cloze","definition","list","true_false","multiple_choice","compare_contrast",
+        "assertion_reason","sequence_ordering","matching_matrix","k_type","best_next_step",
+        "cause_effect","negative"
+    ] = "multiple_choice"
 
 def _norm_stem(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 def _stem_hash(s: str) -> str:
-    return hashlib.sha1(_norm_stem(s).encode()).hexdigest()[:12]
+    return hashlib.sha1(_norm_stem(s).encode()).hexdigest()
 
 def _mcq_dedupe_hashes(existing: List[dict]) -> set[str]:
     return {_stem_hash(x.get("stem","")) for x in existing if x.get("stem")}
@@ -120,7 +170,7 @@ def _assign_ids_and_hashes(items: List[dict]) -> List[dict]:
     for itm in items:
         itm["hash"] = _stem_hash(itm["stem"])
         if not itm.get("id"):
-            itm["id"] = hashlib.md5((itm["hash"] + "|".join(itm["options"])).encode()).hexdigest()[:12]
+            itm["id"] = hashlib.md5((itm["hash"] + "|".join(itm["options"])).encode()).hexdigest()
         out.append(itm)
     return out
 
@@ -236,6 +286,57 @@ def parse_chapter_definitions(definitions: str) -> List[Dict]:
             st.warning(f"Could not parse line: '{line}'. Please use the format: Chapter Title, StartPage-EndPage")
     return chapters
 
+def validate_and_sort_chapter_ranges(chapters: list[dict], total_pages: Optional[int] = None) -> tuple[list[dict], list[str]]:
+    """
+    Normalize chapters to start/end, sort by start_page, and detect overlaps.
+    Accepts either {title, start_page, end_page} or {title, pages: [...]}
+    Returns (normalized_sorted_list, warnings)
+    """
+    norm: list[dict] = []
+    warns: list[str] = []
+
+    for ch in chapters:
+        title = (ch.get("title") or "").strip()
+        if not title:
+            continue
+        if "pages" in ch and ch.get("pages"):
+            s = int(min(ch["pages"]))
+            e = int(max(ch["pages"]))
+        else:
+            s = int(ch.get("start_page", 0) or 0)
+            e = int(ch.get("end_page", 0) or 0)
+        if s > e:
+            s, e = e, s
+        if total_pages:
+            # Clamp start to [1, total_pages]
+            if s < 1:
+                warns.append(f"‘{title}’ start_page {s} < 1. Clamping to 1.")
+                s = 1
+            if s > total_pages:
+                warns.append(f"‘{title}’ start_page {s} > total pages {total_pages}. Clamping to {total_pages}.")
+                s = total_pages
+            # Clamp end to [1, total_pages]
+            if e < 1:
+                warns.append(f"‘{title}’ end_page {e} < 1. Clamping to 1.")
+                e = 1
+            if e > total_pages:
+                warns.append(f"‘{title}’ end_page {e} > total pages {total_pages}. Clamping to {total_pages}.")
+                e = total_pages
+        if title and s >= 1 and e >= 1:
+            norm.append({"title": title, "start_page": s, "end_page": e})
+
+    norm.sort(key=lambda x: x["start_page"])  # order by start
+
+    for i in range(1, len(norm)):
+        prev, cur = norm[i-1], norm[i]
+        if cur["start_page"] <= prev["end_page"]:
+            warns.append(
+                f"‘{cur['title']}’ ({cur['start_page']}-{cur['end_page']}) overlaps previous "
+                f"‘{prev['title']}’ ({prev['start_page']}-{prev['end_page']})."
+            )
+
+    return norm, warns
+
 # --- Gemini API Interaction ---
 def to_part(text: str) -> dict:
     """Return a Gem-compatible PartDict for a text string."""
@@ -244,6 +345,309 @@ def to_part(text: str) -> dict:
 def to_content(role: str, text: str) -> dict:
     """Return a Gem-compatible Content dict (role=user|model)."""
     return {"role": role, "parts": [to_part(text)]}
+
+def extract_chapters_with_gemini(uploaded_file, client: genai.Client) -> List[Dict]:
+    """
+    Use gemini-2.5-flash-lite to extract chapter definitions from a PDF via Files API.
+    Returns a list of dicts: [{title, start_page, end_page}, ...].
+    """
+    # Determine MIME type (force PDF as the app restricts uploads to PDF)
+    mime = "application/pdf"
+
+    # Attempt a lightweight subset approach: extract ToC pages and a few anchor pages.
+    subset_text = None
+    subset_meta = {}
+    
+    
+    try:
+        with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as _doc:
+            total_pages = len(_doc)
+            scan_limit = min(40, total_pages)  # scan first N pages to find ToC
+            
+
+            def _page_text(pi0: int) -> str:
+                try:
+                    return _doc.load_page(pi0).get_text("text") or ""
+                except Exception:
+                    return ""
+
+            toc_candidates = []  # 0-based indices likely containing ToC
+            dotline_re = re.compile(r"\.{2,}\s+\d{1,4}\s*$")
+            toc_kw_re = re.compile(r"\b(contents|table of contents|目錄|目录)\b", re.IGNORECASE)
+            for i in range(scan_limit):
+                t = _page_text(i)
+                if not t:
+                    continue
+                lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+                dot_count = sum(1 for ln in lines if dotline_re.search(ln))
+                has_kw = bool(toc_kw_re.search(t))
+                if has_kw or dot_count >= 3:
+                    toc_candidates.append(i)
+
+            # Collapse consecutive candidates into ranges, use full span from earliest to latest
+            toc_start = toc_end = None
+            if toc_candidates:
+                
+                ranges = []
+                start = toc_candidates[0]
+                prev = start
+                for x in toc_candidates[1:]:
+                    if x == prev + 1:
+                        prev = x
+                        continue
+                    ranges.append((start, prev))
+                    start = prev = x
+                ranges.append((start, prev))
+                
+                # Select from earliest detected page to latest detected page across ALL ranges
+                toc_start = toc_candidates[0]  # Earliest detected page
+                toc_end = toc_candidates[-1]   # Latest detected page
+                
+                if toc_end - toc_start > 19:  # Only trim if range exceeds 20 pages
+                    toc_end = toc_start + 19  # Limit to 20 pages (0-19 inclusive)
+
+            # Build subset payload if we found likely ToC
+            if toc_start is not None:
+                
+                parts = []
+                parts.append(f"DOC_TOTAL_PAGES: {total_pages}")
+                # ToC pages (1-based labels included)
+                for i in range(toc_start, toc_end + 1):
+                    parts.append(f"\n=== TOC_PAGE (pdf_page={i+1}) ===\n" + _page_text(i))
+
+                # Anchor windows: a small window right after ToC, and a later window
+                def _add_window(start_i0: int, count: int, label: str):
+                    if start_i0 < 0 or start_i0 >= total_pages:
+                        return
+                    end_i0 = min(total_pages - 1, start_i0 + count - 1)
+                    for j in range(start_i0, end_i0 + 1):
+                        parts.append(f"\n=== {label} (pdf_page={j+1}) ===\n" + _page_text(j))
+
+                _add_window(toc_end + 1, 10, "ANCHOR_NEAR_TOC")
+
+                subset_text = "\n".join(parts)
+                subset_meta = {
+                    "mode": "subset",
+                    "toc_pages": [toc_start + 1, toc_end + 1],
+                    "total_pages": total_pages,
+                }
+                
+    except Exception as _e:
+        subset_text = None
+        subset_meta = {"mode": "subset_error", "error": str(_e)}
+
+    # If no ToC subset was built, fall back to a generic front-window excerpt so the model can still parse ToC
+    if not subset_text:
+        
+        try:
+            with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as _doc2:
+                total_pages2 = len(_doc2)
+                front = min(30, total_pages2)
+                
+                parts2 = [f"DOC_TOTAL_PAGES: {total_pages2}"]
+                for i in range(front):
+                    try:
+                        parts2.append(f"\n=== FRONT_WINDOW (pdf_page={i+1}) ===\n" + _doc2.load_page(i).get_text("text"))
+                    except Exception:
+                        continue
+                subset_text = "\n".join(parts2)
+                subset_meta = {"mode": "front_window", "total_pages": total_pages2, "pages": [1, front]}
+                
+        except Exception as _e2:
+            subset_text = None
+            subset_meta = {"mode": "subset_error", "error": f"front_window_fallback_failed: {_e2}"}
+
+    # Decide mode: use subset if we have at least one ToC page; else error
+    use_subset = bool(subset_text and subset_text.strip())
+    
+
+    # If no subset text available, raise error instead of falling back to Files API
+    if not use_subset:
+        raise RuntimeError("Could not detect table of contents or extract chapter information. Please define chapters manually.")
+
+    # System instruction: return ToC chapters with inferred end pages
+    system_inst = (
+        "Task: Read the Table of Contents (ToC) and return chapters with inferred end pages.\n\n"
+        "CRITICAL FIRST STEP: Find the actual PDF page where Chapter 1 appears in the document body.\n"
+        "This is essential for accurate page calculations. Search thoroughly through the document.\n\n"
+        "Definitions:\n"
+        "- toc_start_page: The page number as printed in the ToC for a chapter/part (e.g., 1, 23, 145).\n"
+        "- inferred_end_page: The page where this chapter logically ends (typically next chapter start - 1).\n"
+        "- first_chapter_toc_page: The page number as printed in the ToC for Chapter 1.\n"
+        "- first_chapter_actual_page: The actual PDF page where Chapter 1's heading appears (CRITICAL!).\n\n"
+        "Instructions:\n"
+        "1. FIRST: Search the document body and find where 'Chapter 1' (or first numbered chapter) actually appears. Record this page number.\n"
+        "2. Parse ToC for chapter titles and their printed page numbers.\n"
+        "3. For each chapter, infer end page: next chapter start - 1, or references start - 1 for last chapter.\n"
+        "4. EXCLUDE front matter: preface, foreword, acknowledgments, non-numbered introduction.\n"
+        "5. INCLUDE: numbered chapters, named content chapters, parts, units.\n\n"
+        "Output Schema (JSON): { chapters: [{title, toc_start_page, inferred_end_page}], first_chapter_toc_page?: int, first_chapter_actual_page?: int }."
+    )
+
+    cfg = gx.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=TocExtraction,
+        temperature=0.0,
+        system_instruction=system_inst,
+    )
+
+    prompt = (
+        "PRIORITY 1: Find where Chapter 1 actually appears in the document body (not just ToC).\n"
+        "PRIORITY 2: Parse ToC and infer chapter end pages.\n\n"
+        "Return JSON: { chapters: [{title, toc_start_page, inferred_end_page}], first_chapter_toc_page?: int, first_chapter_actual_page?: int }.\n"
+        "\n"
+        "CRITICAL: Search through the document body to find the actual page where Chapter 1 heading appears. This is different from the ToC page number.\n"
+        "\n"
+        "For chapters - Only include content chapters. EXCLUDE:\n"
+        "- Preface, Foreword, Acknowledgments\n"
+        "- Introduction (unless numbered as Chapter 1)\n" 
+        "- References, Bibliography, Index, Appendices, Glossary\n"
+        "\n"
+        "For inferred_end_page - Simple rule:\n"
+        "- End = next chapter start - 1\n"
+        "- Last chapter: end = references start - 1\n"
+        "\n"
+        "REMEMBER: The first_chapter_actual_page is the most critical field for accurate results."
+    )
+
+
+    # Generate model response using subset text only
+    try:
+        contents = f"{prompt}\n\n--- DOCUMENT EXCERPT ---\n{subset_text}"
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=cfg,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Gemini ToC extraction call failed: {e}")
+
+    # Prefer parsed (TocExtraction)
+    toc_result: Dict = {}
+    if getattr(resp, "parsed", None):
+        pr = resp.parsed
+        if hasattr(pr, "model_dump"):
+            toc_result = pr.model_dump(exclude_none=True)
+        elif isinstance(pr, dict):
+            toc_result = pr
+        else:
+            # Fallback to text JSON
+            toc_result = json.loads(getattr(resp, "text", "{}") or "{}")
+    elif getattr(resp, "text", None):
+        toc_result = json.loads(resp.text)
+    else:
+        raise RuntimeError("No response from Gemini ToC extraction")
+
+
+    # Build absolute chapter ranges from chapters with model-inferred end pages + offset
+    chapters_data = toc_result.get("chapters") or []
+    
+    # Normalize and filter chapters
+    norm_chapters: List[Dict] = []
+    front_matter_keywords = {
+        "preface", "foreword", "acknowledgment", "acknowledgments", "introduction", 
+        "references", "bibliography", "index", "appendix", "appendices", "glossary",
+        "table of contents", "contents", "list of figures", "list of tables"
+    }
+    
+    for ch in chapters_data:
+        # Normalize title to single line: collapse all whitespace (incl. newlines) to a single space
+        raw_title = (ch.get("title") or "")
+        t = re.sub(r"\s+", " ", raw_title).strip()
+        
+        # Check if this looks like front matter (case-insensitive)
+        t_lower = t.lower()
+        is_front_matter = any(keyword in t_lower for keyword in front_matter_keywords)
+        
+        # Skip if it looks like front matter, unless it's clearly a numbered chapter
+        if is_front_matter and not re.search(r'\b(chapter|ch\.?)\s*\d+', t_lower):
+            continue
+            
+        try:
+            toc_start = int(ch.get("toc_start_page") or 0)
+            inferred_end = int(ch.get("inferred_end_page") or 0)
+        except Exception:
+            continue
+            
+        if t and toc_start and inferred_end and toc_start > 0 and inferred_end > 0:
+            norm_chapters.append({"title": t, "toc_start_page": toc_start, "inferred_end_page": inferred_end})
+
+    if not norm_chapters:
+        st.warning("No top-level chapters found in ToC.")
+        return []
+
+    # Additional validation: warn if first item still looks like front matter
+    first_title = norm_chapters[0]["title"].lower()
+    if any(keyword in first_title for keyword in ["preface", "foreword", "acknowledgment", "introduction"]):
+        st.warning(f"⚠️ The first chapter appears to be front matter: '{norm_chapters[0]['title']}'. You may need to manually adjust the chapter definitions.")
+
+    # Determine total PDF pages for clamping
+    total_pages = None
+    try:
+        with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as _doc:
+            total_pages = _doc.page_count
+    except Exception:
+        pass
+
+    # Compute offset programmatically from the two page numbers provided by the model
+    offset = None
+    first_chapter_toc_page = toc_result.get("first_chapter_toc_page")
+    first_chapter_actual_page = toc_result.get("first_chapter_actual_page")
+    
+    
+    # If model provided the page numbers, use them
+    if first_chapter_toc_page and first_chapter_actual_page:
+        try:
+            offset = first_chapter_actual_page - first_chapter_toc_page
+        except Exception as e:
+            offset = None
+    
+    # Fallback: find first numbered chapter programmatically
+    if offset is None and first_chapter_actual_page and norm_chapters:
+        
+        try:
+            first_ch = next(ch for ch in norm_chapters if re.search(r'\b(chapter|ch\.?)\s*1\b', ch["title"], re.I))
+            offset = first_chapter_actual_page - first_ch["toc_start_page"]
+        except Exception as e:
+            offset = None
+    
+    if offset is None:
+        st.warning("Could not calculate offset from model response; defaulting to 0. You may need to adjust chapter ranges manually.")
+        offset = 0
+    else:
+        # Handle negative offsets by taking absolute value and warning user
+        if offset < 0:
+            st.warning(f"Calculated negative offset ({offset}). Using absolute value {abs(offset)}. Please verify chapter ranges.")
+            offset = abs(offset)
+
+    # Apply offset to model-inferred chapter ranges
+    final_chapters: List[Dict] = []
+    
+    for ch in norm_chapters:
+        abs_start = ch["toc_start_page"] + offset
+        abs_end = ch["inferred_end_page"] + offset
+        
+        # Clamp to document bounds
+        if total_pages:
+            abs_start = max(1, min(abs_start, total_pages))
+            abs_end = max(1, min(abs_end, total_pages))
+        
+        # Ensure end >= start
+        if abs_end < abs_start:
+            abs_end = abs_start
+        
+        # Ensure title is single-line when stored
+        title = re.sub(r"\s+", " ", ch["title"]).strip()
+        final_chapters.append({"title": title, "start_page": abs_start, "end_page": abs_end})
+
+
+    # Validate/sort and clamp the model-inferred chapter ranges
+    norm, warns = validate_and_sort_chapter_ranges(final_chapters, total_pages=total_pages)
+    for w in warns:
+        st.warning(w)
+    
+    
+    return norm
 
 def get_tutor_response(conv_tree, system_prompt, temperature=0.2):
     # flatten tree path, skip root
@@ -261,6 +665,7 @@ def get_tutor_response(conv_tree, system_prompt, temperature=0.2):
     history = [_content_from_node(n) for n in msgs[:-1]]
     last_user_text = msgs[-1].content
 
+
     from google import genai as _genai_new
     client = _genai_new.Client(api_key=API_KEY)
     chat = client.chats.create(
@@ -272,6 +677,8 @@ def get_tutor_response(conv_tree, system_prompt, temperature=0.2):
         ),
     )
     resp = chat.send_message(last_user_text)
+    
+    
     return resp.text
 
 # --- Flashcard Generation Functions ---
@@ -286,9 +693,9 @@ def _active_cards_and_hashes() -> tuple[list[dict], set[str]]:
     norm_stems = {_h(c.get("q","")) for c in all_cards if c.get("q")}
     return all_cards, norm_stems
 
-def _chapter_excerpt(text: str, limit: int=15000) -> str:
-    # Use your CHAPTER_CHAR_LIMIT logic; show start + key headings if you have them
-    return text[:limit]
+def _chapter_excerpt(text: str) -> str:
+    # Chapter text is already limited by CHAPTER_CHAR_LIMIT during initial processing
+    return text
 
 def _build_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude_norm_stems: set[str]) -> str:
     n = settings["n_cards"]
@@ -298,7 +705,7 @@ def _build_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude
     # Build the base prompt with detailed instructions for each card type
     type_instructions = {
         "basic": "Basic Q&A format with straightforward questions and answers.",
-        "cloze": "Fill-in-the-blank format where key words or phrases are replaced with [...]. Example: 'The [...] is responsible for executive functions' → 'The prefrontal cortex is responsible for executive functions'",
+        "cloze": "Fill-in-the-blank format where key words or phrases are replaced with _____. Example: 'The _____ is responsible for executive functions' → 'The prefrontal cortex is responsible for executive functions'",
         "definition": "Ask for the definition of key terms or concepts. Format as 'Define: [term]' and provide the definition.",
         "list": "Questions that require listing multiple items, steps, or components. Example: 'List the three types of memory' → '1. Sensory memory, 2. Short-term memory, 3. Long-term memory'",
         "true_false": "True/False statements about concepts. Format as 'True or False: [statement]' and provide the correct answer with brief explanation.",
@@ -328,7 +735,7 @@ IMPORTANT: For each flashcard, you MUST include a 'source' field indicating the 
     # Add the deduplication info and chapter content
     base_prompt += f"""
 
-Known question stems to avoid (normalized): {sorted(list(exclude_norm_stems))[:200]}
+Known question stems to avoid (normalized): {sorted(list(exclude_norm_stems))[:500]}
 
 CHAPTER CONTENT:
 ---
@@ -345,6 +752,7 @@ def _generate_flashcards_for_active_chapter():
 
     prompt = _build_prompt(ch["title"], _chapter_excerpt(ch["text"]), s, exclude_norm_stems)
 
+
     with st.spinner("Generating flashcards…"):
         try:
             # Use the global client
@@ -355,7 +763,7 @@ def _generate_flashcards_for_active_chapter():
                 response_mime_type="application/json",
                 response_schema=list[Flashcard],
                 temperature=float(s["temperature"]),
-                system_instruction=f"Avoid generating flashcards whose questions are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:200]}"
+                system_instruction=f"Avoid generating flashcards whose questions are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:500]}"
             )
             
             resp = flash_client.models.generate_content(
@@ -363,6 +771,7 @@ def _generate_flashcards_for_active_chapter():
                 contents=prompt,
                 config=cfg,
             )
+            
             
             # Prefer parsed; fall back to JSON text
             cards = []
@@ -420,7 +829,7 @@ def _generate_flashcards_for_active_chapter():
                     return None
                 c["q"] = q
                 c["a"] = a
-                c["source"] = source[:120]  # Enforce length limit
+                c["source"] = source[:300]  # Enforce length limit
                 c["type"] = c.get("type","basic")
                 c["difficulty"] = c.get("difficulty","medium")
                 c["tags"] = c.get("tags") or []
@@ -460,14 +869,485 @@ def _anki_csv_bytes(cards: list[dict]) -> bytes:
     return sio.getvalue().encode("utf-8")
 
 # --- MCQ Generation Functions ---
-def _chapter_excerpt_for_mcq(text: str, limit: int=15000) -> str:
-    return text[:limit]
+def _chapter_excerpt_for_mcq(text: str) -> str:
+    return text
+
+def _is_two_clause(opt: str) -> bool:
+    """Two-clause option with a clear divider between entity A and entity B."""
+    if not isinstance(opt, str):
+        return False
+    return bool(re.search(r".+\s(?:;|—|–)\s.+", opt.strip()))
+
+
+def _looks_comparative(stem: str) -> bool:
+    """Check for explicit comparative cue in stem."""
+    if not isinstance(stem, str):
+        return False
+    return bool(re.search(r"\b(vs\.?|versus|between|compare|contrast|differentiat\w*)\b", stem, re.IGNORECASE))
+
+
+def _salvage_compare_to_mcq(m: dict) -> dict | None:
+    """If compare/contrast validation fails but item is a valid single-best MCQ, downgrade type."""
+    try:
+        correct = m.get("correct")
+        opts = m.get("options")
+        if isinstance(correct, list) and len(correct) == 1 and isinstance(opts, list) and len(opts) >= 4:
+            m2 = dict(m)
+            m2["qtype"] = "multiple_choice"
+            tags = (m2.get("tags") or [])
+            if "downgraded_from_contrast" not in tags:
+                tags.append("downgraded_from_contrast")
+            m2["tags"] = tags
+            return m2
+    except Exception:
+        return None
+    return None
+
+
+def _looks_negative(stem: str) -> bool:
+    return bool(re.search(r"\b(EXCEPT|NOT)\b", stem or "", re.I))
+
+
+def _is_permutation(s: str) -> bool:
+    """Detect simple token permutations like 'A→B→C→D' or 'A-B-C-D' or '1→2→3'."""
+    if not isinstance(s, str):
+        return False
+    txt = s.strip()
+    return bool(re.search(r"^[A-Za-z0-9]+(\s*[→\-–>]\s*[A-Za-z0-9]+){2,}$", txt))
+
+
+def _is_mapping(s: str) -> bool:
+    """Detect mapping like 'A→2, B→4, C→1, D→3'. Looser variant allows more than A-D/1-4."""
+    if not isinstance(s, str):
+        return False
+    txt = s.strip()
+    return bool(re.search(r"^[A-Za-z]\s*→\s*[0-9]+(\s*,\s*[A-Za-z]\s*→\s*[0-9]+){2,}$", txt))
+
+def _filter_mcqs_by_qtype(mcqs: list[dict], qtype: str, *, audit: Optional[dict] = None, salvage_non_contrast: bool = True) -> list[dict]:
+    """Enforce qtype-specific structural constraints post-generation.
+
+    audit: optional dict to collect reasons for rejection/downgrade.
+    """
+    out: list[dict] = []
+    if audit is not None:
+        audit.setdefault("input", 0)
+        audit.setdefault("kept", 0)
+        audit.setdefault("downgraded", 0)
+        audit.setdefault("reasons", [])
+    for m in mcqs:
+        if audit is not None:
+            audit["input"] += 1
+        stem = (m.get("stem") or "").strip()
+        options = m.get("options") or []
+        correct = m.get("correct") or []
+
+        # Common sanity checks
+        if not stem or not isinstance(options, list) or not options:
+            if audit is not None:
+                audit["reasons"].append("missing stem/options")
+            continue
+        if not isinstance(correct, list) or not correct:
+            if audit is not None:
+                audit["reasons"].append("missing/invalid correct indices")
+            continue
+
+        # Cardinality
+        if qtype in ("list", "k_type"):
+            ok = len(correct) >= 2
+        else:
+            ok = len(correct) == 1
+        if not ok:
+            if audit is not None:
+                audit["reasons"].append("cardinality mismatch")
+            continue
+
+        if qtype == "true_false":
+            # Normalize to strict True/False options and enforce canonical order ["True","False"]
+            if len(options) != 2:
+                if audit is not None:
+                    audit["reasons"].append("true_false not 2 options")
+                continue
+            opt_norm = [str(o).strip().lower() for o in options]
+            # Broaden acceptance to common variants
+            mapping = {
+                "t": "True", "true": "True", "yes": "True", "y": "True", "agree": "True",
+                "f": "False", "false": "False", "no": "False", "n": "False", "disagree": "False",
+            }
+            if all(x in mapping for x in opt_norm):
+                mapped = [mapping[opt_norm[0]], mapping[opt_norm[1]]]
+                # Reorder to ["True","False"] if needed and adjust correct index
+                if mapped == ["True", "False"]:
+                    m["options"] = mapped
+                elif mapped == ["False", "True"]:
+                    m["options"] = ["True", "False"]
+                    # adjust single-correct index (already enforced single-correct below)
+                    if len(correct) == 1:
+                        correct = [0 if correct[0] == 1 else 1]
+                        m["correct"] = correct
+                else:
+                    # If somehow mapped to other words, reject
+                    if audit is not None:
+                        audit["reasons"].append("true_false options not canonical True/False after mapping")
+                    continue
+            else:
+                if audit is not None:
+                    audit["reasons"].append("true_false options not coercible")
+                continue
+
+        elif qtype == "compare_contrast":
+            # 1) Stem must look comparative
+            if not _looks_comparative(stem):
+                if salvage_non_contrast:
+                    salv = _salvage_compare_to_mcq(m)
+                    if salv is not None:
+                        out.append(salv)
+                        if audit is not None:
+                            audit["downgraded"] += 1
+                            audit["reasons"].append("compare_contrast: non-comparative stem -> downgraded")
+                        continue
+                if audit is not None:
+                    audit["reasons"].append("compare_contrast: non-comparative stem")
+                continue
+            # 2) At least 4 options
+            if len(options) < 4:
+                if audit is not None:
+                    audit["reasons"].append("compare_contrast: <4 options")
+                continue
+            # 3) Two-clause options
+            if not all(isinstance(o, str) and _is_two_clause(o) for o in options):
+                if audit is not None:
+                    audit["reasons"].append("compare_contrast: options not two-clause")
+                continue
+            # 4) Forbid All/None/Both/Neither
+            bad = r"\b(all of the above|none of the above|both|neither)\b"
+            if any(re.search(bad, str(o), re.I) for o in options):
+                if audit is not None:
+                    audit["reasons"].append("compare_contrast: forbidden distractor")
+                continue
+
+        elif qtype == "assertion_reason":
+            # Require A: ... and R: ... in stem
+            if not re.search(r"\bA:\b.*\bR:\b", stem, re.S):
+                if audit is not None:
+                    audit["reasons"].append("assertion_reason: missing A:/R: in stem")
+                continue
+            # Exactly 4 canonical options and single correct
+            if len(options) != 4 or len(correct) != 1:
+                if audit is not None:
+                    audit["reasons"].append("assertion_reason: need 4 options and single correct")
+                continue
+            patterns = [
+                "Both A and R are true, and R explains A",
+                "Both A and R are true, but R does not explain A",
+                "A is true, but R is false",
+                "A is false, but R is true",
+            ]
+            # Each canonical phrase should appear at least once across options
+            if not all(any(re.search(re.escape(p), str(o), re.I) for o in options) for p in patterns):
+                if audit is not None:
+                    audit["reasons"].append("assertion_reason: options not canonical AR4 set")
+                continue
+
+        elif qtype == "sequence_ordering":
+            if len(correct) != 1 or len(options) < 4:
+                if audit is not None:
+                    audit["reasons"].append("sequence_ordering: need >=4 options, single correct")
+                continue
+            if not all(isinstance(o, str) and _is_permutation(o) for o in options):
+                if audit is not None:
+                    audit["reasons"].append("sequence_ordering: options not permutations")
+                continue
+
+        elif qtype == "matching_matrix":
+            if len(correct) != 1 or len(options) < 4:
+                if audit is not None:
+                    audit["reasons"].append("matching_matrix: need >=4 options, single correct")
+                continue
+            if not all(isinstance(o, str) and _is_mapping(o) for o in options):
+                if audit is not None:
+                    audit["reasons"].append("matching_matrix: options not mappings")
+                continue
+
+        elif qtype == "k_type":
+            # already enforced multi-correct above; ensure statements look sentence-like
+            if len(options) < 4 or len(correct) < 2:
+                if audit is not None:
+                    audit["reasons"].append("k_type: require >=4 options and >=2 correct")
+                continue
+            if not all(len(str(o).split()) >= 3 for o in options):
+                if audit is not None:
+                    audit["reasons"].append("k_type: options too short/non-statement")
+                continue
+
+        elif qtype == "best_next_step":
+            if len(correct) != 1 or len(options) < 4:
+                if audit is not None:
+                    audit["reasons"].append("best_next_step: need >=4 options, single correct")
+                continue
+            # rudimentary scenario heuristic
+            if len(stem.split()) < 20 or not re.search(r"\b(best next step|should|first)\b", stem, re.I):
+                if audit is not None:
+                    audit["reasons"].append("best_next_step: stem not scenario/next-step style")
+                continue
+
+        elif qtype == "cause_effect":
+            if len(correct) != 1 or len(options) < 4:
+                if audit is not None:
+                    audit["reasons"].append("cause_effect: need >=4 options, single correct")
+                continue
+            kws = ("cause", "causal", "causes")
+            has_causal = sum(1 for o in options if any(k in str(o).lower() for k in kws)) >= 2
+            has_skeptic = any(re.search(r"(no caus|correlation|association.*not.*caus)", str(o), re.I) for o in options)
+            if not (has_causal and has_skeptic):
+                if audit is not None:
+                    audit["reasons"].append("cause_effect: options lack causal vs non-causal balance")
+                continue
+
+        elif qtype == "negative":
+            if len(correct) != 1 or len(options) < 4:
+                if audit is not None:
+                    audit["reasons"].append("negative: need >=4 options, single correct")
+                continue
+            if not _looks_negative(stem):
+                if audit is not None:
+                    audit["reasons"].append("negative: missing NOT/EXCEPT cue in stem")
+                continue
+            if any(re.search(r"\b(all of the above|none of the above)\b", str(o), re.I) for o in options):
+                if audit is not None:
+                    audit["reasons"].append("negative: forbidden all/none distractor")
+                continue
+
+        # Set the qtype field to the selected type for consistency
+        m["qtype"] = qtype
+        out.append(m)
+        if audit is not None:
+            audit["kept"] += 1
+    return out
 
 def _build_mcq_prompt(chapter_title: str, chapter_text: str, settings: dict, exclude_norm_stems: set[str]) -> str:
     n = settings["n_qs"]
     qtype = settings.get("qtype", "multiple_choice")
-    allow_multi = (qtype == "list")
+    allow_multi = (qtype in ("list", "k_type"))
     diff = settings["difficulty_mix"]
+
+    # Per-type guardrails and one-shot examples to steer formatting
+    qtype_rules: dict[str, str] = {
+        "multiple_choice": (
+            "Stems ask for the best answer. Exactly one correct option. 4 options preferred. No 'All/None of the above'."
+        ),
+        "cloze": (
+            "Fill-in-the-blank format. The STEM MUST contain at least one blank indicated by '_____'. "
+            "Options are short tokens/phrases that could fill the blank. Exactly one correct index."
+        ),
+        "definition": (
+            "Ask for the best definition of a given term OR the term that matches a given definition. "
+            "Exactly one correct option. Avoid trivial wording differences."
+        ),
+        "list": (
+            "List-style recognition. At least two options are correct (multiple correct indices). "
+            "Avoid 'All/None of the above'."
+        ),
+        "true_false": (
+            "Binary judgment. Options MUST be exactly ['True','False'] in that order. Exactly one correct index."
+        ),
+        "compare_contrast": (
+            "Stems MUST explicitly compare two named entities using wording like 'X vs Y', 'between X and Y', or 'Which statement correctly contrasts X and Y?'. "
+            "Include both entities by name in the STEM. Each option MUST be a two-clause comparison in the form 'X: … ; Y: …' (use ';', '—', or '–' as the divider). "
+            "Exactly one correct option. Avoid 'All/None/Both/Neither' options."
+        ),
+        "assertion_reason": (
+            "STEM must contain 'A: ...' (Assertion) and 'R: ...' (Reason). "
+            "Options MUST be exactly these four patterns, in any order: "
+            "1) Both A and R true, and R explains A; 2) Both A and R are true, but R does not explain A; "
+            "3) A true, R false; 4) A false, R true. Exactly one correct."
+        ),
+        "sequence_ordering": (
+            "Provide 4–6 labeled steps (e.g., A–D) in the stem. "
+            "Options are different full-order permutations using '→' as divider. Exactly one correct."
+        ),
+        "matching_matrix": (
+            "Provide two sets to match (A–D to 1–4). Each option is a complete mapping like 'A→2, B→4, C→1, D→3'. Exactly one correct."
+        ),
+        "k_type": (
+            "Provide 4–6 standalone statements. Mark ALL that are true. Multiple correct indices (≥2). Avoid 'All/None of the above'."
+        ),
+        "best_next_step": (
+            "Provide a 2–4 sentence scenario then ask: 'What is the best next step?' Exactly one correct option. Options must be plausible actions."
+        ),
+        "cause_effect": (
+            "Given a study finding, pick the best causal interpretation: X→Y, Y→X, third variable, or correlation only. Exactly one correct."
+        ),
+        "negative": (
+            "Include an explicit negative cue in the STEM (e.g., 'All of the following are TRUE EXCEPT:' or 'Which is NOT ...?'). "
+            "Exactly one correct option, the exception. Avoid 'All/None of the above'."
+        ),
+    }
+
+    qtype_examples: dict[str, str] = {
+        "multiple_choice": (
+            '{\n'
+            '  "stem": "Which schedule of reinforcement typically produces the highest, most consistent response rate?",\n'
+            '  "options": ["Fixed interval", "Variable interval", "Fixed ratio", "Variable ratio"],\n'
+            '  "correct": [3],\n'
+            '  "explanation": "Variable ratio schedules reinforce after an unpredictable number of responses, producing high, steady rates.",\n'
+            '  "difficulty": "medium",\n'
+            '  "tags": ["conditioning", "reinforcement"],\n'
+            '  "source": "Section 3.2",\n'
+            '  "qtype": "multiple_choice"\n'
+            "}"
+        ),
+        "cloze": (
+            '{\n'
+            '  "stem": "The primary neurotransmitter at the neuromuscular junction is _____.",\n'
+            '  "options": ["Dopamine", "Serotonin", "Acetylcholine", "GABA"],\n'
+            '  "correct": [2],\n'
+            '  "explanation": "Acetylcholine mediates synaptic transmission at the neuromuscular junction.",\n'
+            '  "difficulty": "easy",\n'
+            '  "tags": ["neuroscience", "neurotransmitters"],\n'
+            '  "source": "Page 45",\n'
+            '  "qtype": "cloze"\n'
+            "}"
+        ),
+        "definition": (
+            '{\n'
+            '  "stem": "Which option best defines construct validity?",\n'
+            '  "options": [\n'
+            '    "The consistency of a measure across time",\n'
+            '    "The extent to which a test measures the theoretical trait it intends to measure",\n'
+            '    "Agreement between different raters",\n'
+            '    "The representativeness of a sample"\n'
+            '  ],\n'
+            '  "correct": [1],\n'
+            '  "explanation": "Construct validity reflects how well a test captures the intended theoretical construct.",\n'
+            '  "difficulty": "medium",\n'
+            '  "tags": ["measurement", "validity"],\n'
+            '  "source": "Section 5.1",\n'
+            '  "qtype": "definition"\n'
+            "}"
+        ),
+        "list": (
+            '{\n'
+            '  "stem": "Which of the following are core components of working memory? (Select all that apply)",\n'
+            '  "options": [\n'
+            '    "Central executive",\n'
+            '    "Phonological loop",\n'
+            '    "Iconic store",\n'
+            '    "Visuospatial sketchpad",\n'
+            '    "Episodic buffer"\n'
+            '  ],\n'
+            '  "correct": [0,1,3,4],\n'
+            '  "explanation": "Baddeley’s model includes central executive, phonological loop, visuospatial sketchpad, and episodic buffer.",\n'
+            '  "difficulty": "medium",\n'
+            '  "tags": ["memory"],\n'
+            '  "source": "Section 7.3",\n'
+            '  "qtype": "list"\n'
+            "}"
+        ),
+        "true_false": (
+            '{\n'
+            '  "stem": "True or False: Classical conditioning involves learning the consequences of behavior.",\n'
+            '  "options": ["True", "False"],\n'
+            '  "correct": [1],\n'
+            '  "explanation": "Learning consequences of behavior is operant conditioning; classical conditioning pairs stimuli.",\n'
+            '  "difficulty": "easy",\n'
+            '  "tags": ["conditioning"],\n'
+            '  "source": "Page 112",\n'
+            '  "qtype": "true_false"\n'
+            "}"
+        ),
+        "compare_contrast": (
+            '{\n'
+            '  "stem": "Section 6.1 vs Section 6.2: which statement correctly contrasts them?",\n'
+            '  "options": [\n'
+            '    "6.1: assigns IP to members; 6.2: assigns IP to institution",\n'
+            '    "6.1: institution holds IP for directed work; 6.2: member gives credit/disclaimer for incidental work",\n'
+            '    "6.1: forbids all publication; 6.2: mandates publication",\n'
+            '    "6.1: requires client consent for any publication; 6.2: never requires consent"\n'
+            '  ],\n'
+            '  "correct": [1],\n'
+            '  "explanation": "6.1 covers institution IP for directed work; 6.2 covers member credit/disclaimer for incidental work.",\n'
+            '  "difficulty": "medium",\n'
+            '  "tags": ["Intellectual property"],\n'
+            '  "source": "Section 6.1–6.2",\n'
+            '  "qtype": "compare_contrast"\n'
+            "}"
+        ),
+        "assertion_reason": (
+            '{\n'
+            '  "stem": "A: Section 6.1 assigns IP to the institution. R: Because directed work is owned by the employer.",\n'
+            '  "options": [\n'
+            '    "Both A and R are true, and R explains A",\n'
+            '    "Both A and R are true, but R does not explain A",\n'
+            '    "A is true, but R is false",\n'
+            '    "A is false, but R is true"\n'
+            '  ],\n'
+            '  "correct": [0],\n'
+            '  "explanation": "Directed work is typically employer-owned; R explains A.",\n'
+            '  "difficulty": "medium", "tags": ["IP"], "source": "§6.1", "qtype": "assertion_reason"\n'
+            "}"
+        ),
+        "sequence_ordering": (
+            '{\n'
+            '  "stem": "Put the disciplinary process in order (A–D): A: Notice → B: Investigation → C: Hearing → D: Sanction",\n'
+            '  "options": ["A→B→C→D","A→C→B→D","B→A→C→D","A→B→D→C"],\n'
+            '  "correct": [0],\n'
+            '  "explanation": "Notice precedes investigation, then hearing, then sanction.",\n'
+            '  "difficulty": "medium", "tags": ["process"], "source": "§X", "qtype":"sequence_ordering"\n'
+            "}"
+        ),
+        "matching_matrix": (
+            '{\n'
+            '  "stem": "Match each subsection to its focus (A–D → 1–4).",\n'
+            '  "options": [\n'
+            '    "A→2, B→4, C→1, D→3", "A→3, B→4, C→1, D→2", "A→4, B→1, C→2, D→3", "A→2, B→1, C→4, D→3"\n'
+            '  ],\n'
+            '  "correct": [3],\n'
+            '  "explanation": "Based on the subsection content.",\n'
+            '  "difficulty": "medium", "tags":["mapping"], "source":"§X", "qtype":"matching_matrix"\n'
+            "}"
+        ),
+        "k_type": (
+            '{\n'
+            '  "stem": "Which statements are true about Sections 6.1–6.2? (Select all that apply)",\n'
+            '  "options": [\n'
+            '    "6.1 covers directed work ownership.",\n'
+            '    "6.2 requires disclaimers for incidental work.",\n'
+            '    "6.1 mandates publication of all findings.",\n'
+            '    "6.2 forbids giving credit."\n'
+            '  ],\n'
+            '  "correct": [0,1],\n'
+            '  "explanation": "First two are accurate; the others are not.",\n'
+            '  "difficulty":"medium","tags":["policy"],"source":"§6.1–6.2","qtype":"k_type"\n'
+            "}"
+        ),
+        "best_next_step": (
+            '{\n'
+            '  "stem": "A client discloses X and Y during intake. The organization’s confidentiality policy applies, and the supervisor is unavailable. What is the best next step?",\n'
+            '  "options": ["Proceed without documentation","Delay all action","Consult policy and document actions taken","Share details with peers informally"],\n'
+            '  "correct": [2],\n'
+            '  "explanation": "Consult the policy and document decisions.",\n'
+            '  "difficulty":"medium","tags":["practice"],"source":"§Policy","qtype":"best_next_step"\n'
+            "}"
+        ),
+        "cause_effect": (
+            '{\n'
+            '  "stem": "A cross-sectional study finds a strong association between A and B. What is the best supported inference?",\n'
+            '  "options": ["A causes B","B causes A","A and B are caused by C","Association does not establish causality"],\n'
+            '  "correct": [3],\n'
+            '  "explanation": "Cross-sectional association cannot by itself establish direction.",\n'
+            '  "difficulty":"easy","tags":["methods"],"source":"§Methods","qtype":"cause_effect"\n'
+            "}"
+        ),
+        "negative": (
+            '{\n'
+            '  "stem": "All of the following are true of Section 6.1 EXCEPT:",\n'
+            '  "options": ["Applies to directed work","Institution holds IP","Members always retain sole authorship","Covers employer-owned outputs"],\n'
+            '  "correct": [2],\n'
+            '  "explanation": "Members do not always retain sole authorship.",\n'
+            '  "difficulty":"medium","tags":["policy"],"source":"§6.1","qtype":"negative"\n'
+            "}"
+        ),
+    }
 
     style = """Write exam-quality MCQs.
 - Use clear, unambiguous stems.
@@ -475,7 +1355,11 @@ def _build_mcq_prompt(chapter_title: str, chapter_text: str, settings: dict, exc
 - Prefer 4 options; more if needed. Avoid 'All/None of the above' unless pedagogically strong.
 - Include a short explanation referencing the chapter content.
 - Tag with section/topic; include difficulty from {diff}.
-- {multi}"""
+- {multi}
+
+QTYPE-SPECIFIC RULES ({qtype}): {rules}
+
+Follow the schema EXACTLY. Do not include any text outside JSON in your final output."""
 
     # Enforce cardinality based on setting
     multi_instruction = (
@@ -488,7 +1372,9 @@ def _build_mcq_prompt(chapter_title: str, chapter_text: str, settings: dict, exc
 
     style = style.format(
         diff=", ".join(diff),
-        multi=f"{multi_instruction}\n- {type_hint}"
+        multi=f"{multi_instruction}\n- {type_hint}",
+        qtype=qtype,
+        rules=qtype_rules.get(qtype, "Use standard MCQ formatting.")
     )
 
     # Schema hint for the model output (always include)
@@ -501,7 +1387,7 @@ list[MCQ] where MCQ = {
   "difficulty": "easy"|"medium"|"hard",
   "tags": List[str],
   "source": str,
-  "qtype": "basic"|"cloze"|"definition"|"list"|"true_false"|"multiple_choice"|"compare_contrast"
+    "qtype": "cloze"|"definition"|"list"|"true_false"|"multiple_choice"|"compare_contrast"|"assertion_reason"|"sequence_ordering"|"matching_matrix"|"k_type"|"best_next_step"|"cause_effect"|"negative"
 }"""
 
     # Add custom instructions if provided
@@ -509,16 +1395,21 @@ list[MCQ] where MCQ = {
     if custom_instructions:
         style += f"\n\nAdditional Instructions: {custom_instructions}"
 
+    # Include a one-shot example for the selected type to steer formatting
+    example_block = f"Example for type '{qtype}':\n{qtype_examples.get(qtype, qtype_examples['multiple_choice'])}"
+
     prompt = f"""
 You are creating MCQs strictly from the chapter.
 
 Chapter Title: {chapter_title}
 
-Known question stems to avoid (normalized): {sorted(list(exclude_norm_stems))[:200]}
+Known question stems to avoid (normalized): {sorted(list(exclude_norm_stems))[:500]}
 
 {style}
 
 {schema_hint}
+
+{example_block}
 
 Generate {n} MCQs.
 
@@ -536,6 +1427,7 @@ def generate_mcqs_for_active_chapter():
     exclude_norm_stems = _mcq_norm_stems(existing)
     prompt = _build_mcq_prompt(ch["title"], _chapter_excerpt_for_mcq(ch["text"]), s, exclude_norm_stems)
 
+
     with st.spinner("Generating MCQs…"):
         try:
             from google import genai as _genai_new
@@ -543,52 +1435,102 @@ def generate_mcqs_for_active_chapter():
 
             cfg = gx.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=list[MCQ],
+                response_schema=list[MCQGen],
                 temperature=float(s["temperature"]),
-                system_instruction=f"Avoid generating MCQs whose stems are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:200]}"
+                system_instruction=f"Avoid generating MCQs whose stems are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:500]}"
             )
+
+            # Debug header (no prompt or raw output printing)
+            try:
+                print("\n===== MCQ GEN DEBUG (generate_mcqs_for_active_chapter) =====")
+            except Exception:
+                pass
+
             resp = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config=cfg,
             )
 
+
             # Prefer parsed; fallback to JSON text
             mcqs = []
+            raw_list = None
             try:
                 if hasattr(resp, "parsed") and resp.parsed:
-                    mcqs = [x.model_dump() for x in resp.parsed]
+                    # Convert MCQGen items to plain dicts; enrich later
+                    raw_list = [x.model_dump() for x in resp.parsed]
+                    mcqs = list(raw_list)
                 elif resp.text:
-                    mcqs = json.loads(resp.text)
+                    raw_list = json.loads(resp.text)
+                    mcqs = list(raw_list)
                 else:
                     st.error("No response received from API")
                     return
             except json.JSONDecodeError:
-                st.warning("Received incomplete response. Trying to extract valid MCQs…")
-                text = resp.text or ""
-                # VERY lenient fallback; you can tighten this later
+                st.warning("Received incomplete response. Trying to extract valid MCQs...")
+                # Try to extract valid cards from partial JSON
                 try:
-                    mcqs = json.loads(text[text.find("["):text.rfind("]")+1])
-                except Exception:
-                    st.error("Could not parse MCQs from the response.")
+                    # Look for complete card objects in the response
+                    text = resp.text or ""
+                    card_pattern = r'\{[^{}]*"q":[^{}]*"a":[^{}]*\}'
+                    matches = re.findall(card_pattern, text)
+                    partial_mcqs = []
+                    for match in matches:
+                        try:
+                            partial_mcqs.append(json.loads(match))
+                        except:
+                            continue
+                    if partial_mcqs:
+                        mcqs = partial_mcqs
+                        st.info(f"Recovered {len(mcqs)} MCQs from partial response")
+                    else:
+                        st.error("Could not recover any MCQs from response. Try reducing the number of questions.")
+                        return
+                except Exception as e2:
+                    st.error(f"Could not parse response: {e2}")
                     return
+            except Exception as e:
+                st.error(f"Unexpected error parsing response: {e}")
+                return
 
-            # Cleanup, cardinality enforcement, dedupe, and save
+            # Log pre-filter raw list size
+            try:
+                from collections import Counter  # local import for minimal scope
+                print(f"Raw MCQ count (pre-filter): {len(raw_list) if isinstance(raw_list, list) else 'N/A'}")
+            except Exception:
+                pass
+
+            # Cleanup, type enforcement, dedupe, and save
             mcqs = [m for m in mcqs if m.get("stem") and m.get("options") and isinstance(m.get("correct"), list)]
-            # Enforce cardinality based on qtype (list = multiple correct)
-            if st.session_state.mcq_settings.get("qtype") == "list":
-                mcqs = [m for m in mcqs if len(m.get("correct", [])) >= 2]
-            else:
-                mcqs = [m for m in mcqs if len(m.get("correct", [])) == 1]
-            # Ensure qtype exists
-            for m in mcqs:
-                if not m.get("qtype"):
-                    m["qtype"] = "multiple_choice"
+            audit: dict = {}
+            mcqs = _filter_mcqs_by_qtype(mcqs, st.session_state.mcq_settings.get("qtype", "multiple_choice"), audit=audit, salvage_non_contrast=True)
             mcqs = _assign_ids_and_hashes(mcqs)
             new_only = [m for m in mcqs if m["hash"] not in exclude_hashes]
 
+            # Debug: final items first, then filtered items
+            try:
+                print("===== MCQ GEN DEBUG: FINAL NEW ITEMS (after dedupe) =====")
+                print(json.dumps(new_only, ensure_ascii=False, indent=2))
+                print(f"Final new items count: {len(new_only)}\n")
+                print("===== MCQ GEN DEBUG: ITEMS KEPT AFTER QTYPE FILTER =====")
+                print(json.dumps(mcqs, ensure_ascii=False, indent=2))
+                print(f"Kept after qtype filter: {len(mcqs)} | Downgraded: {audit.get('downgraded', 0)}")
+                # Rejection stats
+                try:
+                    from collections import Counter
+                    total_in = audit.get("input", 0)
+                    kept = audit.get("kept", 0)
+                    reasons = Counter(audit.get("reasons", []))
+                    print(f"QTYPE filter: kept {kept}/{total_in}")
+                    print("Top rejection reasons:", reasons.most_common(10))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
             st.session_state.mcq_by_chapter.setdefault(st.session_state.active_chapter_index, []).extend(new_only)
-            st.success(f"Added {len(new_only)} new MCQs (filtered {len(mcqs)-len(new_only)} duplicates).")
+            st.success(f"Added {len(new_only)} new MCQs (filtered {len(mcqs)-len(new_only)} duplicates). Kept {audit.get('kept', len(new_only))}, downgraded {audit.get('downgraded', 0)}.")
             st.rerun()
             
         except Exception as e:
@@ -597,6 +1539,7 @@ def generate_mcqs_for_active_chapter():
 
 def mcqs_from_flashcards(cards: list[dict], k: int=10) -> list[dict]:
     """Generate MCQs from existing flashcards"""
+    
     pool = [c for c in cards if c.get("type","basic") in ("basic","definition")]
     random.shuffle(pool)
     out = []
@@ -612,7 +1555,10 @@ def mcqs_from_flashcards(cards: list[dict], k: int=10) -> list[dict]:
             "stem": stem, "options": options, "correct": corr_idx,
             "explanation": correct, "difficulty": c.get("difficulty","medium"),
             "tags": c.get("tags",[]), "source": c.get("source","flashcard"),
+            "qtype": "multiple_choice",
         })
+    
+    
     return _assign_ids_and_hashes(out)
 
 # -----------------------------------------------------------------------------
@@ -676,8 +1622,14 @@ def render_mcq_generate():
                 "definition",
                 "true_false",
                 "compare_contrast",
-                "basic",
                 "cloze",
+                "assertion_reason",
+                "sequence_ordering",
+                "matching_matrix",
+                "k_type",
+                "best_next_step",
+                "cause_effect",
+                "negative",
             ]
             mcq_type_labels = {
                 "multiple_choice": "Standard MCQ",
@@ -685,8 +1637,14 @@ def render_mcq_generate():
                 "definition": "Definition",
                 "true_false": "True/False",
                 "compare_contrast": "Compare/Contrast",
-                "basic": "Basic Q&A",
                 "cloze": "Cloze (fill-in-blank)",
+                "assertion_reason": "Assertion–Reason",
+                "sequence_ordering": "Sequence Ordering",
+                "matching_matrix": "Matching (Matrix)",
+                "k_type": "Multiple True/False (K-type)",
+                "best_next_step": "Best Next Step (Scenario)",
+                "cause_effect": "Cause vs. Correlation",
+                "negative": "EXCEPT / NOT",
             }
             current_qtype = st.session_state.mcq_settings.get("qtype", "multiple_choice")
             qtype_sel = st.selectbox(
@@ -779,10 +1737,17 @@ def generate_mcqs_wizard():
 
     cfg = gx.GenerateContentConfig(
         response_mime_type="application/json",
-        response_schema=list[MCQ],
+        response_schema=list[MCQGen],
         temperature=float(s["temperature"]),
-        system_instruction=f"Avoid generating MCQs whose stems are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:200]}"
+        system_instruction=f"Avoid generating MCQs whose stems are semantically similar to any of these normalized stems: {sorted(list(exclude_norm_stems))[:500]}"
     )
+
+    # Debug header (no prompt or raw output printing)
+    try:
+        print("\n===== MCQ GEN DEBUG (generate_mcqs_wizard) =====")
+    except Exception:
+        pass
+
     resp = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
@@ -791,32 +1756,62 @@ def generate_mcqs_wizard():
 
     # Parse response
     mcqs = []
+    raw_list = None
     try:
         if hasattr(resp, "parsed") and resp.parsed:
-            mcqs = [x.model_dump() for x in resp.parsed]
+            # Convert MCQGen items to plain dicts; enrich later
+            raw_list = [x.model_dump() for x in resp.parsed]
+            mcqs = list(raw_list)
         elif resp.text:
-            mcqs = json.loads(resp.text)
+            raw_list = json.loads(resp.text)
+            mcqs = list(raw_list)
         else:
             raise Exception("No response received from API")
     except json.JSONDecodeError:
         st.warning("Received incomplete response. Trying to extract valid MCQs…")
         text = resp.text or ""
         try:
-            mcqs = json.loads(text[text.find("["):text.rfind("]")+1])
+            raw_list = json.loads(text[text.find("["):text.rfind("]")+1])
+            mcqs = list(raw_list)
         except Exception:
             raise Exception("Could not parse MCQs from the response.")
 
-    # Cleanup, cardinality enforcement, and dedupe
+    # (No parsed-before-filtering print per user request)
+
+    # Log pre-filter raw list size
+    try:
+        from collections import Counter  # local import for minimal scope
+        print(f"Raw MCQ count (pre-filter): {len(raw_list) if isinstance(raw_list, list) else 'N/A'}")
+    except Exception:
+        pass
+
+    # Cleanup, type enforcement, dedupe, and save
     mcqs = [m for m in mcqs if m.get("stem") and m.get("options") and isinstance(m.get("correct"), list)]
-    if st.session_state.mcq_settings.get("qtype") == "list":
-        mcqs = [m for m in mcqs if len(m.get("correct", [])) >= 2]
-    else:
-        mcqs = [m for m in mcqs if len(m.get("correct", [])) == 1]
-    for m in mcqs:
-        if not m.get("qtype"):
-            m["qtype"] = "multiple_choice"
+    audit: dict = {}
+    mcqs = _filter_mcqs_by_qtype(mcqs, st.session_state.mcq_settings.get("qtype", "multiple_choice"), audit=audit, salvage_non_contrast=True)
     mcqs = _assign_ids_and_hashes(mcqs)
     new_only = [m for m in mcqs if m["hash"] not in exclude_hashes]
+
+    # Debug: final items first, then filtered items
+    try:
+        print("===== MCQ GEN DEBUG: FINAL NEW ITEMS (after dedupe) =====")
+        print(json.dumps(new_only, ensure_ascii=False, indent=2))
+        print(f"Final new items count: {len(new_only)}\n")
+        print("===== MCQ GEN DEBUG: ITEMS KEPT AFTER QTYPE FILTER =====")
+        print(json.dumps(mcqs, ensure_ascii=False, indent=2))
+        print(f"Kept after qtype filter: {len(mcqs)} | Downgraded: {audit.get('downgraded', 0)}")
+        # Rejection stats
+        try:
+            from collections import Counter
+            total_in = audit.get("input", 0)
+            kept = audit.get("kept", 0)
+            reasons = Counter(audit.get("reasons", []))
+            print(f"QTYPE filter: kept {kept}/{total_in}")
+            print("Top rejection reasons:", reasons.most_common(10))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # Store in wizard state
     st.session_state.mcq["generated"]["items"] = new_only
@@ -824,7 +1819,7 @@ def generate_mcqs_wizard():
     st.session_state.mcq["generated"]["params"] = dict(s)
     st.session_state.mcq["generated"]["timestamp"] = datetime.now(timezone.utc).isoformat()
     
-    st.success(f"Generated {len(new_only)} new MCQs!")
+    st.success(f"Generated {len(new_only)} new MCQs! (kept {audit.get('kept', len(new_only))}, downgraded {audit.get('downgraded', 0)})")
 
 def render_mcq_test():
     """Render the Test step of MCQ wizard"""
@@ -1024,8 +2019,26 @@ def render_mcq_review():
     st.markdown("#### Detailed Question Review")
     
     for i, q in enumerate(items):
-        # Show full question text in expander title (no truncation)
-        with st.expander(f"Q{i+1}: {q['stem']}"):
+        # Determine if user got this question correct (for emoji in title)
+        emoji = ""
+        if test_state["submitted"] and test_state.get("shuffled_items"):
+            shuffled_items = test_state["shuffled_items"]
+            for si, sq in enumerate(shuffled_items):
+                if sq.get("original_index") == i:
+                    user_response = test_state["responses"].get(si)
+                    if user_response is not None:
+                        # Map user response back through option permutation to original indices
+                        opt_perm = sq.get("_opt_perm", list(range(len(q["options"]))))
+                        original_user_response = [opt_perm[idx] for idx in user_response]
+                        correct_answer = set(q["correct"])
+                        if set(original_user_response) == correct_answer:
+                            emoji = "✅ "
+                        else:
+                            emoji = "❌ "
+                    break
+        
+        # Show full question text in the expander title with emoji (no truncation)
+        with st.expander(f"{emoji}Q{i+1}: {q['stem']}"):
             st.markdown(f"**Question:** {q['stem']}")
             
             # Show options; if user responded, mark their selected options with ✅ if correct, ❌ if incorrect
@@ -1046,16 +2059,31 @@ def render_mcq_review():
             # Render options with appropriate markers
             if selected_original_response is not None:
                 for j, opt in enumerate(q['options']):
-                    if j in selected_original_response:
-                        marker = "✅" if j in q['correct'] else "❌"
+                    # Determine the marker for this option
+                    if j in q['correct']:
+                        # This is a correct option - always show ✅
+                        marker = "✅"
+                    elif j in selected_original_response:
+                        # User selected this incorrect option - show ❌
+                        marker = "❌"
                     else:
+                        # Neither correct nor selected by user - show ○
                         marker = "○"
-                    st.markdown(f"{marker} {chr(65+j)}. {opt}")
+                    
+                    # Bold the correct options
+                    if j in q['correct']:
+                        st.markdown(f"{marker} **{chr(65+j)}. {opt}**")
+                    else:
+                        st.markdown(f"{marker} {chr(65+j)}. {opt}")
             else:
                 # Fallback: highlight correct options when no user selection available
                 for j, opt in enumerate(q['options']):
                     marker = "✅" if j in q['correct'] else "○"
-                    st.markdown(f"{marker} {chr(65+j)}. {opt}")
+                    # Bold the correct options
+                    if j in q['correct']:
+                        st.markdown(f"{marker} **{chr(65+j)}. {opt}**")
+                    else:
+                        st.markdown(f"{marker} {chr(65+j)}. {opt}")
             
             if q.get('explanation'):
                 st.markdown(f"**Explanation:** {q['explanation']}")
@@ -1073,7 +2101,7 @@ def render_mcq_review():
                             original_user_response = [opt_perm[idx] for idx in user_response]
                             
                             correct_letters = [chr(65+idx) for idx in q['correct']]
-                            st.markdown(f"**Correct Answer:** {', '.join(correct_letters)}")
+                            st.markdown(f"**Correct Answer:** **{', '.join(correct_letters)}**")
                         break
             
             # Metadata
@@ -1349,8 +2377,8 @@ if "chapters" not in st.session_state: st.session_state.chapters = []
 if "active_chapter_index" not in st.session_state: st.session_state.active_chapter_index = 0
 if "editing_msg_id" not in st.session_state: st.session_state.editing_msg_id = None
 if "editing_content" not in st.session_state: st.session_state.editing_content = ""
-if "conversational_style" not in st.session_state: st.session_state.conversational_style = "Standard"
-if "document_reliance" not in st.session_state: st.session_state.document_reliance = 5
+if "conversational_style" not in st.session_state: st.session_state.conversational_style = "Concise"
+if "document_reliance" not in st.session_state: st.session_state.document_reliance = 3
 
 # --- Flashcard Session State ---
 if "flashcards_by_chapter" not in st.session_state:
@@ -1422,46 +2450,108 @@ if not st.session_state.chapters:
         type="pdf"
     )
 
+
     if uploaded_file:
+        # Clear stale auto text when a new PDF is uploaded
+        new_name = getattr(uploaded_file, "name", None)
+        prev_name = st.session_state.get("last_pdf_name")
+        if new_name and new_name != prev_name:
+            st.session_state.pop("auto_chapter_text", None)
+        st.session_state["last_pdf_name"] = new_name
+        
         st.header("Step 2: Define Chapters")
-        st.markdown(
-            "Enter each chapter on a new line using the format: `Chapter Title, StartPage-EndPage`"
-        )
-        st.markdown(
-            "**Example:**\n"
-            "Introduction to AI, 1-10\n"
-            "History of Neural Networks, 11-25"
-        )
+        
+        # Option 1 + Download side-by-side (wider buttons; download shown disabled until available)
+        col_opt1, col_dl, _ = st.columns([2, 2, 6])
+        with col_opt1:
+            auto_clicked_top = st.button("Automatically Extract Chapter Definitions", use_container_width=True)
+        with col_dl:
+            current_text = (
+                (st.session_state.get("chapter_definitions_text", "").strip())
+                or (st.session_state.get("auto_chapter_text", "").strip())
+            )
+            st.download_button(
+                label="Download .txt Chapter Parsing File",
+                data=(current_text.encode("utf-8") if current_text else b""),
+                file_name=f"{os.path.splitext(uploaded_file.name)[0]}_chapters.txt",
+                mime="text/plain",
+                key="download_chapters_txt_top",
+                disabled=not bool(current_text),
+                use_container_width=True,
+            )
         
         # Option to upload chapter definitions from a text file
         uploaded_definitions_file = st.file_uploader(
-            "Upload a .txt file with chapter definitions or manually enter them below",
+            "If available, upload a .txt file for chapter parsing",
             type="txt",
-            help="Upload a text file where each line contains: Chapter Title, StartPage-EndPage"
         )
         
-        with st.form("chapter_form"):
-            # Pre-populate with uploaded file content if available
-            default_text = ""
-            if uploaded_definitions_file is not None:
+        # Handle Option 1 click (auto extraction)
+        if 'auto_clicked_top' in locals() and auto_clicked_top:
+            with st.spinner("Extracting chapters with Gemini..."):
                 try:
-                    # Read the uploaded file content
+                    extracted = extract_chapters_with_gemini(uploaded_file, client)
+                    # Build lines from validated/sorted extracted list
+                    lines = [f"{ch['title']}, {ch['start_page']}-{ch['end_page']}" for ch in extracted]
+                    text_out = "\n".join(lines)
+                    if not text_out:
+                        st.warning("No chapters were extracted. You can still enter them manually.")
+                    else:
+                        st.session_state.auto_chapter_text = text_out
+                        st.success(f"Extracted {len(lines)} chapter(s). You can edit them, then click 'Process Document and Chapters' or download the .txt.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Automatic extraction failed: {e}")
+        
+        with st.form("chapter_form"):
+            # Pre-populate with uploaded file content if available (and any auto extracted text)
+            default_text = st.session_state.get("auto_chapter_text", "")
+            if uploaded_definitions_file is not None and not default_text:
+                try:
                     default_text = uploaded_definitions_file.read().decode("utf-8")
                 except Exception as e:
                     st.error(f"Error reading uploaded file: {e}")
             
             chapter_definitions_text = st.text_area(
-                "Chapter Definitions",
+                "Detected Chapter Parsing (Manual Input Available):",
                 value=default_text,
                 height=150,
-                placeholder="For example:\n\nChapter 1: The Beginning, 1-20\nChapter 2: The Middle, 21-55"
+                placeholder="For example:\n\nChapter 1: The Beginning, 1-20\nChapter 2: The Middle, 21-55",
+                key="chapter_definitions_text",
             )
-            submitted = st.form_submit_button("Process Document and Chapters")
 
-        if submitted and chapter_definitions_text:
+            col_process = st.columns([1])[0]
+            with col_process:
+                submitted = st.form_submit_button("Process Document and Chapters", type="primary")
+
+        if submitted and st.session_state.get("chapter_definitions_text"):
             with st.spinner("Processing document... This may take a moment."):
-                parsed_chapters = parse_chapter_definitions(chapter_definitions_text)
+                parsed_chapters = parse_chapter_definitions(st.session_state["chapter_definitions_text"]) 
                 if parsed_chapters:
+                    # Validate and sort manual input against total pages
+                    as_ranges = []
+                    for ch in parsed_chapters:
+                        pages = ch["pages"]
+                        as_ranges.append({
+                            "title": ch["title"],
+                            "start_page": min(pages),
+                            "end_page": max(pages),
+                        })
+                    total_pages = None
+                    try:
+                        with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as _doc:
+                            total_pages = len(_doc)
+                    except Exception:
+                        pass
+                    norm, warns = validate_and_sort_chapter_ranges(as_ranges, total_pages=total_pages)
+                    for w in warns:
+                        st.warning(w)
+                    # Rebuild parsed_chapters from validated ranges
+                    parsed_chapters = [
+                        {"title": ch["title"], "pages": list(range(ch["start_page"], ch["end_page"] + 1))}
+                        for ch in norm
+                    ]
+
                     file_bytes = uploaded_file.getvalue()
                     # Extract text for each chapter and store it
                     for chapter in parsed_chapters:
@@ -1481,14 +2571,22 @@ if not st.session_state.chapters:
                     }
                     st.session_state.active_chapter_index = 0
                     reset_chat_session()  # Initialize the chat for the first chapter
+                    # Clear stale auto text after successful processing
+                    st.session_state.pop("auto_chapter_text", None)
                     st.rerun()
                 else:
                     st.error("No valid chapter definitions found. Please check the format.")
+
+        
 
 # STATE 2: CHAT VIEW
 else:
     # --- Sidebar for Chapter Selection and Settings ---
     with st.sidebar:
+
+        # Document info at the top
+        if st.session_state.uploaded_file_info:
+            st.info(f"**Document:**\n{st.session_state.uploaded_file_info['name']}")
 
         st.header("Session Setup")
 
@@ -1503,6 +2601,27 @@ else:
             on_change=reset_all_for_new_chapter # Reset both chat and MCQ when chapter changes
         )
         
+        # Display info about the selected chapter
+        if st.session_state.chapters:
+            selected_chapter = st.session_state.chapters[selected_chapter_index]
+            
+            # Calculate chapter info
+            page_range = selected_chapter['pages']
+            toc_start = min(page_range)
+            toc_end = max(page_range)
+            num_pages = len(page_range)
+            
+            # Check for text truncation
+            chapter_text = selected_chapter.get('text', '')
+            text_length = len(chapter_text)
+            was_truncated = text_length >= CHAPTER_CHAR_LIMIT
+            
+            # Display chapter information
+            st.caption(f"""
+            • PDF Page Range: {toc_start}-{toc_end} ({num_pages} pages)
+            \n• Text Length: {text_length:,} characters{' (truncated)' if was_truncated else ''}
+            """)
+        
         st.markdown("---")
 
         # Conversation Style Selection
@@ -1511,7 +2630,7 @@ else:
             "How the AI revision assistant interacts:",
             options=list(CONVERSATIONAL_STYLES.keys()),
             key="conversational_style",
-            help="Different styles will change how the AI responds to your questions"
+            help="Different styles will change how the AI responds to you in the Conversation tab"
         )
         
         st.markdown("---")
@@ -1536,10 +2655,7 @@ else:
             5: "Very High - Document content only"
         }
         
-        st.markdown("---")
-
-        if st.session_state.uploaded_file_info:
-            st.info(f"**Document:**\n{st.session_state.uploaded_file_info['name']}")
+        # st.markdown("---")
 
         if st.button("Start with a New Document"):
             # Clear all session state to return to upload view
@@ -1595,7 +2711,6 @@ else:
     
     # FLASHCARDS TAB
     with tab_flash:
-
         # Generation settings in two columns at the top
         st.markdown("### Generation Settings")
         col1, col2 = st.columns([1,1])
@@ -1618,7 +2733,7 @@ else:
             # Add descriptions for each card type
             card_type_descriptions = {
                 "basic": "Basic Q&A format",
-                "cloze": "Fill-in-the-blank [...] format",
+                "cloze": "Fill-in-the-blank _____ format",
                 "definition": "Define key terms/concepts",
                 "list": "List items, steps, or components",
                 "true_false": "True/False statements",
@@ -1647,10 +2762,11 @@ else:
                 key="flash_temp_slider",
             )
             difficulty_options = ["mixed","easy","medium","hard"]
+            current = s["difficulty"]
             s["difficulty"] = st.selectbox(
                 "Difficulty:", 
                 difficulty_options,
-                index=difficulty_options.index(s["difficulty"]),
+                index=difficulty_options.index(current),
                 format_func=lambda x: x.capitalize()
             )
 
@@ -1819,8 +2935,14 @@ else:
                 "definition",
                 "true_false",
                 "compare_contrast",
-                "basic",
                 "cloze",
+                "assertion_reason",
+                "sequence_ordering",
+                "matching_matrix",
+                "k_type",
+                "best_next_step",
+                "cause_effect",
+                "negative",
             ]
             mcq_type_labels = {
                 "multiple_choice": "Standard MCQ",
@@ -1828,8 +2950,14 @@ else:
                 "definition": "Definition",
                 "true_false": "True/False",
                 "compare_contrast": "Compare/Contrast",
-                "basic": "Basic Q&A",
                 "cloze": "Cloze (fill-in-blank)",
+                "assertion_reason": "Assertion–Reason",
+                "sequence_ordering": "Sequence Ordering",
+                "matching_matrix": "Matching (Matrix)",
+                "k_type": "Multiple True/False (K-type)",
+                "best_next_step": "Best Next Step (Scenario)",
+                "cause_effect": "Cause vs. Correlation",
+                "negative": "EXCEPT / NOT",
             }
             current_qtype = s.get("qtype", "multiple_choice")
             s["qtype"] = st.selectbox(
@@ -1862,15 +2990,108 @@ else:
         imported = st.file_uploader("**(Optional)** Upload JSON file to import existing MCQs", type="json", key="mcq_uploader")
         if imported:
             try:
-                data = json.load(imported)
-                if isinstance(data, dict) and "items" in data:
-                    data = data["items"]  # Handle export format
-                assert isinstance(data, list)
-                ch_idx = st.session_state.active_chapter_index
-                st.session_state.mcq_by_chapter.setdefault(ch_idx, [])
-                st.session_state.mcq_by_chapter[ch_idx].extend(data)
-                st.success(f"Imported {len(data)} MCQs.")
-                st.rerun()
+                raw = json.load(imported)
+                # Support both {"items": [...]} and plain list
+                items = raw.get("items") if isinstance(raw, dict) else raw
+                if not isinstance(items, list):
+                    raise ValueError("JSON must be a list of MCQs or an object with an 'items' list")
+
+                def _coerce_int_list(v):
+                    if isinstance(v, list):
+                        return [int(x) for x in v if isinstance(x, (int, float))]
+                    return []
+
+                seen_hashes = _mcq_dedupe_hashes(st.session_state.mcq_by_chapter.get(st.session_state.active_chapter_index, []))
+                normalized = []
+                skipped = 0
+                reindexed = 0
+                downgraded_basic = 0
+                out_of_range_fixed = 0
+                for it in items:
+                    if not isinstance(it, dict):
+                        skipped += 1
+                        continue
+                    stem = (it.get("stem") or "").strip()
+                    options = it.get("options") or []
+                    if not stem or not isinstance(options, list) or len(options) < 2:
+                        # Drop trivially invalid (need at least 2 options; generation prefers >=4, but allow 2 for TF)
+                        skipped += 1
+                        continue
+                    # Normalize qtype
+                    qtype = (it.get("qtype") or "multiple_choice").strip()
+                    if qtype == "basic":
+                        qtype = "multiple_choice"
+                        downgraded_basic += 1
+                    # Fix common typos (extra spaces etc.)
+                    if qtype.replace(" ", "") == "multiplechoice":
+                        qtype = "multiple_choice"
+                    # Coerce correct indices
+                    correct = _coerce_int_list(it.get("correct"))
+                    if not correct:
+                        # Attempt to salvage: if original had 'answer' and it's an option string
+                        ans = it.get("answer") or it.get("a")
+                        if ans and isinstance(ans, str) and ans in options:
+                            correct = [options.index(ans)]
+                    # Convert 1-based indices if any equals len(options) (common import mistake) and 0 not present
+                    if correct and max(correct) >= len(options):
+                        # Try shifting to 0-based if all between 1 and len(options)
+                        if all(1 <= c <= len(options) for c in correct):
+                            correct = [c - 1 for c in correct]
+                            reindexed += 1
+                        else:
+                            # Drop out-of-range values
+                            new_correct = [c for c in correct if 0 <= c < len(options)]
+                            if new_correct:
+                                out_of_range_fixed += 1
+                                correct = new_correct
+                            else:
+                                skipped += 1
+                                continue
+                    # Final guard: single or multi list not empty
+                    if not correct:
+                        skipped += 1
+                        continue
+                    explanation = (it.get("explanation") or "").strip()
+                    difficulty = (it.get("difficulty") or "medium").lower()
+                    if difficulty not in {"easy","medium","hard"}:
+                        difficulty = "medium"
+                    tags = it.get("tags") or []
+                    if not isinstance(tags, list):
+                        tags = []
+                    source = (it.get("source") or "").strip()
+                    m = {
+                        "stem": stem,
+                        "options": [str(o).strip() for o in options],
+                        "correct": correct,
+                        "explanation": explanation,
+                        "difficulty": difficulty,
+                        "tags": tags,
+                        "source": source,
+                        "qtype": qtype or "multiple_choice",
+                        "id": it.get("id",""),
+                        "hash": it.get("hash",""),
+                        "meta": it.get("meta"),
+                    }
+                    # Assign hash/id if missing
+                    if not m["hash"]:
+                        m["hash"] = _stem_hash(m["stem"])
+                    if not m["id"]:
+                        m["id"] = hashlib.md5((m["hash"] + "|" + "|".join(m["options"]) ).encode()).hexdigest()
+                    if m["hash"] in seen_hashes:
+                        continue
+                    seen_hashes.add(m["hash"])
+                    normalized.append(m)
+
+                if not normalized:
+                    st.error("No valid MCQs found in file after normalization; ensure each item has a stem, >=2 options, and valid correct indices.")
+                else:
+                    ch_idx = st.session_state.active_chapter_index
+                    st.session_state.mcq_by_chapter.setdefault(ch_idx, [])
+                    st.session_state.mcq_by_chapter[ch_idx].extend(normalized)
+                    st.success(
+                        f"Imported {len(normalized)} MCQs (skipped {skipped}; basic→multiple_choice {downgraded_basic}; reindexed {reindexed}; trimmed out-of-range {out_of_range_fixed})."
+                    )
+                    st.rerun()
             except Exception as e:
                 st.error(f"Invalid JSON: {e}")
 
@@ -1878,9 +3099,20 @@ else:
         if "custom_mcq_instructions" not in st.session_state:
             st.session_state.custom_mcq_instructions = ""
         
+        # Optional compare/contrast entity hints
+        entity_hint = ""
+        if s.get("qtype") == "compare_contrast":
+            col_e1, col_e2 = st.columns(2)
+            with col_e1:
+                ent_a = st.text_input("Entity A (optional)", key="cc_entity_a")
+            with col_e2:
+                ent_b = st.text_input("Entity B (optional)", key="cc_entity_b")
+            if ent_a and ent_b:
+                entity_hint = f" When making compare/contrast MCQs, focus on: {ent_a} vs {ent_b}. Use both names in the stem and two-clause options."
+
         st.session_state.custom_mcq_instructions = st.text_area(
             "**(Optional)** Add specific instructions to guide MCQ generation:",
-            value=st.session_state.custom_mcq_instructions,
+            value=(st.session_state.custom_mcq_instructions + entity_hint) if entity_hint else st.session_state.custom_mcq_instructions,
             placeholder="e.g., Focus on application questions, include scenario-based questions, avoid trivial details, etc.",
             height=80,
             help="These instructions will be included in the prompt to help generate more targeted MCQs"
@@ -2009,5 +3241,3 @@ else:
                     st.session_state.mcq_by_chapter[st.session_state.active_chapter_index] = []
                     st.success("All MCQs deleted!")
                     st.rerun()
-
-    # Quiz/Results are rendered exclusively above when active
