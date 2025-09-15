@@ -1,0 +1,7 @@
+# Streamlit server config to increase upload/message size limits (in MB)
+# Requires app restart/redeploy to take effect.
+# Note: Hosting platforms or proxies may impose lower hard limits.
+
+[server]
+maxUploadSize = 1024       # Allow uploads up to 1 GB
+maxMessageSize = 1024      # Allow WebSocket messages up to 1 GB
